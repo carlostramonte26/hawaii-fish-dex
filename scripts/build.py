@@ -93,6 +93,20 @@ STATUS_LABEL = {
 }
 ENDEMIC_STATUSES = {"endemic", "endemic_nwhi"}
 
+# Phases worth photographing separately. Labrids and scarids are protogynous,
+# so initial/terminal is the right vocabulary there — a terminal-phase fish is
+# usually a secondary male, and initial phase holds females and some males.
+# male/female is for gonochoristic species that are simply dimorphic.
+PHASE_LABEL = {
+    "juvenile": "Juvenile",
+    "subadult": "Subadult",
+    "adult": "Adult",
+    "initial": "Initial phase",
+    "terminal": "Terminal phase",
+    "male": "Male",
+    "female": "Female",
+}
+
 # Set by main() so helpers can stay quiet when the tool drives the build.
 SAY = [print]
 
@@ -116,6 +130,7 @@ class Species:
     common_name: str = ""
     hawaiian_name: str = ""
     status: str = "indigenous"
+    phases: tuple = ()
     notes: str = ""
     aphia_id: str = ""
     photos: list = field(default_factory=list)
@@ -131,6 +146,22 @@ class Species:
     @property
     def display_name(self) -> str:
         return self.common_name or self.scientific_name
+
+    @property
+    def phases_seen(self) -> list:
+        got = {p.phase for p in self.photos if p.phase}
+        return [ph for ph in self.phases if ph in got]
+
+    @property
+    def phases_missing(self) -> list:
+        return [ph for ph in self.phases if ph not in self.phases_seen]
+
+    @property
+    def complete(self) -> bool:
+        """Nothing left to photograph for this species."""
+        if not self.phases:
+            return self.seen
+        return self.seen and not self.phases_missing
 
     @property
     def regions(self) -> list:
@@ -156,6 +187,7 @@ class Photo:
     height: int = 0
     date: str = ""
     site: str = ""
+    phase: str = ""
     note: str = ""
     lat: float | None = None
     lng: float | None = None
@@ -202,6 +234,10 @@ def load_species() -> dict:
                 common_name=(row.get("common_name") or "").strip(),
                 hawaiian_name=(row.get("hawaiian_name") or "").strip(),
                 status=status,
+                phases=tuple(
+                    ph for ph in
+                    (x.strip().lower() for x in (row.get("phases") or "").split("|"))
+                    if ph in PHASE_LABEL),
                 notes=(row.get("notes") or "").strip(),
                 aphia_id=(row.get("aphia_id") or "").strip(),
             )
@@ -462,6 +498,7 @@ def collect_photos(species: dict, idx: dict) -> tuple:
                                pin=f"img/{stem}-pin.jpg",
                                width=w, height=h, date=date,
                                site=str(site), lat=lat, lng=lng,
+                               phase=str(side.get("phase") or "").strip().lower(),
                                note=str(side.get("note") or "")))
         matched += 1
 
@@ -527,9 +564,17 @@ def card(sp: Species) -> str:
     else:
         media = '<span class="blank"></span>'
     haw = f'<span class="haw">{e(sp.hawaiian_name)}</span>' if sp.hawaiian_name else ""
+    pips = ""
+    if sp.phases:
+        dots = "".join(
+            f'<i class="{"on" if ph in sp.phases_seen else ""}" '
+            f'title="{e(PHASE_LABEL[ph])}"></i>' for ph in sp.phases)
+        pips = (f'<span class="pips" aria-label="{len(sp.phases_seen)} of '
+                f'{len(sp.phases)} phases">{dots}</span>')
     return f"""<a class="card {seen}" href="species/{sp.slug}.html"
    data-status="{e(sp.status)}" data-family="{e(sp.family)}"
    data-seen="{'1' if sp.seen else '0'}"
+   data-partial="{'1' if (sp.seen and sp.phases_missing) else '0'}"
    data-search="{e(' '.join(filter(None, [sp.scientific_name, sp.common_name, sp.hawaiian_name, sp.family])).lower())}">
   <figure>{media}</figure>
   <div class="meta">
@@ -537,6 +582,7 @@ def card(sp: Species) -> str:
     <p class="sci">{e(sp.scientific_name)}</p>
     {haw}
     <span class="badge s-{e(sp.status)}">{e(STATUS_LABEL[sp.status])}</span>
+    {pips}
   </div>
 </a>"""
 
@@ -592,6 +638,9 @@ def render_index(species: dict) -> str:
     nwhi_total = sum(1 for s in ordered if s.status == "endemic_nwhi")
     nwhi_seen = sum(1 for s in ordered if s.status == "endemic_nwhi" and s.seen)
     pct = (seen / total * 100) if total else 0
+    phase_total = sum(len(s.phases) for s in ordered)
+    phase_seen = sum(len(s.phases_seen) for s in ordered)
+    part_done = sum(1 for s in ordered if s.seen and s.phases_missing)
 
     data = pings(species)
     from_nwhi = sum(1 for p in data if p["lng"] < NWHI_CUTOFF)
@@ -608,14 +657,15 @@ def render_index(species: dict) -> str:
   <div class="wrap">
     <p class="who">{e(OWNER)}</p>
     <h1>{e(TITLE)}</h1>
-    <p class="lede">Every reef fish I have photographed in Hawaiian waters, where
-    I found it, and every one I still haven't.</p>
+    <p class="lede">Reef fishes of the Hawaiian Archipelago, photographed as I
+    find them. Where each one was, what it is, and how much of the list is
+    still ahead of me.</p>
   </div>
 </header>
 
 <section class="tally">
   <div class="wrap">
-    <p class="big"><strong>{seen}</strong><span>of {total} caught on camera</span></p>
+    <p class="big"><strong>{seen}</strong><span>of {total} photographed</span></p>
     <div class="progress"><span style="width:{pct:.1f}%"></span></div>
     <div class="mapwrap">
       <div id="map" data-empty="{'1' if not data else '0'}"></div>
@@ -624,6 +674,7 @@ def render_index(species: dict) -> str:
     <div class="legend">{legend}</div>
     <dl class="numbers">
       <div><dt>Frames in the catalog</dt><dd>{frames}</dd></div>
+      <div><dt>Phases photographed</dt><dd>{phase_seen} of {phase_total}</dd></div>
       <div><dt>Frames with a position</dt><dd>{len(data)}</dd></div>
       <div><dt>Shot in the NWHI</dt><dd>{from_nwhi}</dd></div>
       <div><dt>Endemics</dt><dd>{endemic_seen} of {endemic_total}</dd></div>
@@ -646,6 +697,7 @@ def render_index(species: dict) -> str:
     <button type="button" data-seen="" class="on">All</button>
     <button type="button" data-seen="1">Photographed</button>
     <button type="button" data-seen="0">Still missing</button>
+    <button type="button" data-partial="1">Missing a phase ({part_done})</button>
   </div>
   <p class="shown" id="shown"></p>
 </nav>
@@ -673,22 +725,43 @@ def render_species(sp: Species, species: dict) -> str:
                    if s.family == sp.family and s.scientific_name != sp.scientific_name]
     same_family.sort(key=lambda s: (not s.seen, s.scientific_name))
 
-    if sp.seen:
-        shots = []
-        for p in sp.photos:
-            caption = " · ".join(filter(None, [p.date, p.site, p.note]))
-            shots.append(f"""<figure>
+    def plate(p):
+        caption = " · ".join(filter(None, [p.date, p.site, p.note]))
+        return f"""<figure>
   <img src="../{e(p.full)}" alt="{e(sp.display_name)}" loading="lazy"
        width="{p.width}" height="{p.height}">
   {f'<figcaption>{e(caption)}</figcaption>' if caption else ''}
-</figure>""")
-        gallery = f'<div class="plates">{"".join(shots)}</div>'
+</figure>"""
+
+    if sp.seen:
+        if sp.phases:
+            blocks = []
+            for ph in sp.phases:
+                got = [p for p in sp.photos if p.phase == ph]
+                if got:
+                    blocks.append(f'<h2 class="phasehead">{e(PHASE_LABEL[ph])}</h2>'
+                                  f'{"".join(plate(p) for p in got)}')
+                else:
+                    blocks.append(
+                        f'<h2 class="phasehead">{e(PHASE_LABEL[ph])}</h2>'
+                        f'<div class="gap"><p>Not photographed yet.</p></div>')
+            loose = [p for p in sp.photos if p.phase not in sp.phases]
+            if loose:
+                blocks.append('<h2 class="phasehead">Unassigned</h2>'
+                              + "".join(plate(p) for p in loose))
+            gallery = f'<div class="plates">{"".join(blocks)}</div>'
+        else:
+            gallery = f'<div class="plates">{"".join(plate(p) for p in sp.photos)}</div>'
     else:
         gallery = '<div class="plates missing"><p>Not photographed yet.</p></div>'
 
     rows = [("Family", sp.family or "—"),
             ("Hawaiian name", sp.hawaiian_name or "—"),
             ("Origin", STATUS_LABEL[sp.status])]
+    if sp.phases:
+        got = ", ".join(PHASE_LABEL[ph] for ph in sp.phases_seen) or "none yet"
+        rows.append(("Phases photographed",
+                     f"{got} ({len(sp.phases_seen)} of {len(sp.phases)})"))
     if sp.regions:
         rows.append(("I've found it in", ", ".join(sp.regions)))
     if sp.notes:

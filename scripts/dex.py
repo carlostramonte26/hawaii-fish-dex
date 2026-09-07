@@ -20,6 +20,7 @@ from __future__ import annotations
 import csv
 import json
 import mimetypes
+import urllib.request
 import os
 import re
 import shutil
@@ -104,6 +105,9 @@ def species_rows() -> list:
                     "haw": (row.get("hawaiian_name") or "").strip(),
                     "family": (row.get("family") or "").strip(),
                     "status": (row.get("status") or "").strip(),
+                    "phases": [x.strip().lower()
+                               for x in (row.get("phases") or "").split("|")
+                               if x.strip()],
                 })
     return sorted(out, key=lambda r: r["sci"])
 
@@ -118,6 +122,40 @@ def already_shot() -> set:
         except Exception:
             continue
     return {n for n in names if n}
+
+
+STATUSES = ["endemic", "endemic_nwhi", "indigenous", "introduced",
+            "not_in_hawaii", "waif", "questionable"]
+
+PHASE_LABEL = {
+    "juvenile": "Juvenile", "subadult": "Subadult", "adult": "Adult",
+    "initial": "Initial phase", "terminal": "Terminal phase",
+    "male": "Male", "female": "Female",
+}
+
+
+def worms_lookup(name: str) -> dict:
+    """Ask WoRMS for the accepted name, family and AphiaID. Best effort."""
+    if len(name.split()) < 2:
+        return {"error": "type a full scientific name first"}
+    url = ("https://www.marinespecies.org/rest/AphiaRecordsByName/"
+           + urllib.parse.quote(name) + "?like=false&marine_only=true")
+    try:
+        with urllib.request.urlopen(url, timeout=12) as resp:
+            if resp.status == 204:
+                return {"error": f"WoRMS has no record for {name}"}
+            records = json.loads(resp.read().decode("utf-8"))
+    except Exception as err:
+        return {"error": f"couldn't reach WoRMS ({err})"}
+    if not records:
+        return {"error": f"WoRMS has no record for {name}"}
+    rec = next((r for r in records if r.get("status") == "accepted"), records[0])
+    return {
+        "aphia_id": str(rec.get("AphiaID") or ""),
+        "family": rec.get("family") or "",
+        "accepted": rec.get("valid_name") or "",
+        "worms_status": rec.get("status") or "",
+    }
 
 
 def safe_name(text: str) -> str:
@@ -173,6 +211,10 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json({"species": species_rows(),
                                    "shot": sorted(already_shot())})
 
+        if path == "/api/worms":
+            name = (urllib.parse.parse_qs(parsed.query).get("name") or [""])[0]
+            return self.send_json(worms_lookup(name.strip()))
+
         if path == "/api/status":
             return self.send_json({"build": dict(LAST_BUILD), "git": git_state()})
 
@@ -213,11 +255,53 @@ class Handler(BaseHTTPRequestHandler):
             return self.stage(parsed, body)
         if parsed.path == "/api/commit":
             return self.commit(body)
+        if parsed.path == "/api/species":
+            return self.add_species(body)
         if parsed.path == "/api/build":
             return self.send_json({"build": rebuild()})
         if parsed.path == "/api/publish":
             return self.publish(body)
         return self.send_json({"error": "not found"}, 404)
+
+    def add_species(self, body):
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except Exception:
+            return self.send_json({"error": "bad request"}, 400)
+
+        sci = " ".join((payload.get("scientific_name") or "").split())
+        if len(sci.split()) < 2:
+            return self.send_json(
+                {"error": "give a full scientific name, e.g. Oplegnathus punctatus"}, 400)
+
+        status = (payload.get("status") or "indigenous").strip().lower()
+        if status not in STATUSES:
+            return self.send_json({"error": f"unknown status '{status}'"}, 400)
+
+        existing = {r["sci"].lower() for r in species_rows()}
+        if sci.lower() in existing:
+            return self.send_json({"error": f"{sci} is already in the checklist"}, 400)
+
+        row = {
+            "scientific_name": sci,
+            "aphia_id": (payload.get("aphia_id") or "").strip(),
+            "family": (payload.get("family") or "").strip(),
+            "common_name": (payload.get("common_name") or "").strip(),
+            "hawaiian_name": (payload.get("hawaiian_name") or "").strip(),
+            "status": status,
+            "phases": "|".join(
+                ph for ph in (payload.get("phases") or []) if ph in PHASE_LABEL),
+            "notes": (payload.get("notes") or "").strip(),
+        }
+
+        with DATA.open(newline="", encoding="utf-8") as fh:
+            fields = csv.DictReader(fh).fieldnames or list(row)
+        with DATA.open("a", newline="", encoding="utf-8") as fh:
+            csv.DictWriter(fh, fieldnames=fields).writerow(
+                {k: row.get(k, "") for k in fields})
+
+        print(f"  added {sci} to the checklist ({status})")
+        return self.send_json({"ok": True, "species": row, "build": rebuild()})
 
     def publish(self, body):
         state = git_state()
@@ -335,6 +419,9 @@ class Handler(BaseHTTPRequestHandler):
             "lng": lng,
             "nomap": bool(payload.get("nomap")),
         }
+        phase = (payload.get("phase") or "").strip().lower()
+        if phase in PHASE_LABEL:
+            sidecar["phase"] = phase
         if payload.get("note"):
             sidecar["note"] = str(payload["note"]).strip()
         dest.with_suffix(".json").write_text(
@@ -399,6 +486,19 @@ button:disabled{opacity:.45;cursor:default}
 .check{display:flex;align-items:center;gap:.45rem;margin-top:.7rem;font-size:.85rem;color:var(--muted)}
 .check input{accent-color:var(--gold)}
 .new{color:var(--gold)}
+.dive{border:1px solid var(--line);border-radius:3px;padding:1rem 1.1rem;margin-bottom:1.2rem}
+.dive h2{margin:0;font-size:1rem;font-weight:600}
+.divegrid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.2fr);gap:1.2rem;margin-top:.8rem}
+.divegrid .map{height:210px}
+.newsp{border:1px solid var(--line);border-radius:3px;padding:.8rem 1.1rem;margin:1.2rem 0}
+.newsp summary{cursor:pointer;font-size:.92rem;color:var(--gold)}
+.newgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:1.2rem;margin-top:.9rem}
+.newgrid .btn{margin-top:.8rem}
+.phasepick{display:grid;grid-template-columns:1fr 1fr;gap:.2rem .6rem;margin-top:.2rem}
+.phasepick label{display:flex;align-items:center;gap:.4rem;margin:0;font-size:.85rem;color:var(--fg)}
+.phasepick input{accent-color:var(--gold)}
+select:disabled{opacity:.5}
+@media (max-width:800px){.divegrid,.newgrid{grid-template-columns:1fr}}
 </style></head><body>
 <header>
   <div class="bar">
@@ -414,13 +514,71 @@ button:disabled{opacity:.45;cursor:default}
   <p id="pubmsg" class="pubmsg"></p>
 </header>
 <main>
+  <section class="dive">
+    <h2>This dive</h2>
+    <p class="hint">Set it once. Every photo you add picks these up, and you can
+    still change any of them per fish.</p>
+    <div class="divegrid">
+      <div>
+        <label>Date</label><input type="date" id="dive-date">
+        <label>Site</label><input type="text" id="dive-site" placeholder="Kure Atoll">
+        <div class="check"><input type="checkbox" id="dive-lock" checked>
+          <label for="dive-lock" style="margin:0">Reuse this pin for every new photo</label></div>
+        <p class="coords" id="dive-coords">No dive pin set</p>
+      </div>
+      <div><div class="map" id="dive-map"></div></div>
+    </div>
+  </section>
+
   <div id="drop">Drop photos here, or click to choose files
     <input type="file" id="file" multiple accept="image/*"></div>
+
+  <details class="newsp">
+    <summary>Fish not on the list? Add it to the checklist</summary>
+    <div class="newgrid">
+      <div>
+        <label>Scientific name</label>
+        <input type="text" id="ns-sci" placeholder="Oplegnathus punctatus">
+        <button type="button" class="btn ghost" id="ns-look">Look up in WoRMS</button>
+        <p class="hint" id="ns-msg"></p>
+      </div>
+      <div>
+        <label>Common name</label><input type="text" id="ns-common">
+        <label>Hawaiian name</label><input type="text" id="ns-haw">
+      </div>
+      <div>
+        <label>Family</label><input type="text" id="ns-family">
+        <label>Origin</label>
+        <select id="ns-status">
+          <option value="indigenous">Indigenous</option>
+          <option value="endemic">Hawaiian endemic</option>
+          <option value="endemic_nwhi">NWHI endemic</option>
+          <option value="introduced">Introduced</option>
+          <option value="waif">Waif</option>
+          <option value="questionable">Questionable</option>
+        </select>
+        <label>Phases to track</label>
+        <div class="phasepick" id="ns-phases">
+          <label><input type="checkbox" value="juvenile"> Juvenile</label>
+          <label><input type="checkbox" value="initial"> Initial phase</label>
+          <label><input type="checkbox" value="terminal"> Terminal phase</label>
+          <label><input type="checkbox" value="female"> Female</label>
+          <label><input type="checkbox" value="male"> Male</label>
+          <label><input type="checkbox" value="adult"> Adult</label>
+        </div>
+        <p class="hint">Leave empty unless the fish genuinely looks different.
+        Use initial/terminal for wrasses and parrotfishes.</p>
+        <button type="button" class="btn" id="ns-add">Add to checklist</button>
+      </div>
+    </div>
+  </details>
   <div id="list"></div>
 </main>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script>
-var SPECIES = [], SHOT = new Set();
+var SPECIES = [], SHOT = new Set(), LAST_PHASE = "";
+var PHASE_LABEL = {juvenile:"Juvenile", subadult:"Subadult", adult:"Adult",
+  initial:"Initial phase", terminal:"Terminal phase", male:"Male", female:"Female"};
 var HAWAII = [[18.6,-179.5],[22.6,-154.6]];
 
 function refreshStatus(){
@@ -441,8 +599,89 @@ function refreshStatus(){
   });
 }
 
+var DIVE = { lat:null, lng:null, marker:null, map:null };
+
+function setDivePin(lat, lng, zoom){
+  DIVE.lat = lat; DIVE.lng = lng;
+  if (DIVE.marker) DIVE.marker.setLatLng([lat,lng]);
+  else DIVE.marker = L.marker([lat,lng], {draggable:true}).addTo(DIVE.map)
+    .on("dragend", function(){
+      var q = DIVE.marker.getLatLng(); setDivePin(q.lat, q.lng);
+    });
+  document.getElementById("dive-coords").textContent =
+    lat.toFixed(6) + ", " + lng.toFixed(6);
+  if (zoom) DIVE.map.setView([lat,lng], zoom);
+}
+
+function initDiveMap(){
+  DIVE.map = L.map("dive-map", { scrollWheelZoom:true });
+  L.tileLayer("https://tiles.maps.eox.at/wmts/1.0.0/s2cloudless-2024_3857/default/g/{z}/{y}/{x}.jpg",
+    { maxZoom:19, maxNativeZoom:14,
+      attribution:"Sentinel-2 cloudless by EOX (CC BY 4.0)" }).addTo(DIVE.map);
+  DIVE.map.fitBounds(HAWAII);
+  DIVE.map.on("click", function(e){ setDivePin(e.latlng.lat, e.latlng.lng); });
+}
+
+function addSpecies(){
+  var msg = document.getElementById("ns-msg");
+  var body = {
+    scientific_name: document.getElementById("ns-sci").value,
+    common_name: document.getElementById("ns-common").value,
+    hawaiian_name: document.getElementById("ns-haw").value,
+    family: document.getElementById("ns-family").value,
+    status: document.getElementById("ns-status").value,
+    aphia_id: document.getElementById("ns-sci").dataset.aphia || "",
+    phases: Array.prototype.slice.call(
+      document.querySelectorAll("#ns-phases input:checked")).map(function(b){
+        return b.value; })
+  };
+  fetch("/api/species", {method:"POST", headers:{"Content-Type":"application/json"},
+    body: JSON.stringify(body)}).then(function(r){return r.json()}).then(function(res){
+    if (res.error){ msg.style.color="#ff9c7d"; msg.textContent=res.error; return; }
+    msg.style.color="#7ee0c0";
+    msg.textContent = res.species.scientific_name + " added. It's in the dropdown now.";
+    SPECIES.push({sci:res.species.scientific_name, common:res.species.common_name,
+      haw:res.species.hawaiian_name, family:res.species.family,
+      status:res.species.status,
+      phases:(res.species.phases||"").split("|").filter(Boolean)});
+    SPECIES.sort(function(a,b){ return a.sci < b.sci ? -1 : 1; });
+    document.querySelectorAll("datalist").forEach(function(dl){
+      var o = document.createElement("option");
+      o.value = res.species.scientific_name;
+      o.textContent = res.species.scientific_name +
+        (res.species.common_name ? " — " + res.species.common_name : "") + " +";
+      dl.appendChild(o);
+    });
+    ["ns-sci","ns-common","ns-haw","ns-family"].forEach(function(id){
+      document.getElementById(id).value = "";
+    });
+    refreshStatus();
+  });
+}
+
+function lookupWorms(){
+  var field = document.getElementById("ns-sci");
+  var msg = document.getElementById("ns-msg");
+  msg.style.color = ""; msg.textContent = "Asking WoRMS…";
+  fetch("/api/worms?name=" + encodeURIComponent(field.value.trim()))
+    .then(function(r){return r.json()}).then(function(d){
+      if (d.error){ msg.style.color="#ff9c7d"; msg.textContent=d.error; return; }
+      if (d.family) document.getElementById("ns-family").value = d.family;
+      field.dataset.aphia = d.aphia_id || "";
+      var note = "AphiaID " + d.aphia_id + (d.family ? " · " + d.family : "");
+      if (d.accepted && d.accepted.toLowerCase() !== field.value.trim().toLowerCase()) {
+        msg.style.color = "#f5b840";
+        note += " · WoRMS accepts this as " + d.accepted;
+      } else { msg.style.color = "#7ee0c0"; }
+      msg.textContent = note;
+    });
+}
+
 document.addEventListener("DOMContentLoaded", function(){
   refreshStatus();
+  initDiveMap();
+  document.getElementById("ns-look").addEventListener("click", lookupWorms);
+  document.getElementById("ns-add").addEventListener("click", addSpecies);
   document.getElementById("publish").addEventListener("click", function(){
     var pub = this, msg = document.getElementById("pubmsg");
     var what = prompt("Commit message", "Add photos");
@@ -515,6 +754,7 @@ function render(d){
       '<input type="text" class="sci" list="'+mapId+'-list" placeholder="Start typing a name">'+
       '<datalist id="'+mapId+'-list">'+opts+'</datalist>'+
       '<p class="hint">A <span class="new">+</span> marks a species you have no photo of yet.</p>'+
+      '<label>Phase</label><select class="phase"><option value="">Not tracked</option></select>'+
       '<label>Date</label><input type="date" class="date" value="'+(d.date||"")+'">'+
       '<label>Site</label><input type="text" class="site" placeholder="Kāneʻohe Bay">'+
       '<label>Note</label><textarea class="note" rows="2"></textarea>'+
@@ -533,7 +773,29 @@ function render(d){
   document.getElementById("list").prepend(wrap);
 
   var sci = wrap.querySelector(".sci");
+  var phaseSel = wrap.querySelector(".phase");
+
+  function syncPhases(){
+    var name = sci.value.split(" — ")[0].trim().toLowerCase();
+    var hit = SPECIES.filter(function(s){ return s.sci.toLowerCase() === name; })[0];
+    var list = (hit && hit.phases) ? hit.phases : [];
+    phaseSel.innerHTML = list.length
+      ? '<option value="">Pick a phase</option>'
+      : '<option value="">No phases tracked for this species</option>';
+    list.forEach(function(ph){
+      var o = document.createElement("option");
+      o.value = ph; o.textContent = PHASE_LABEL[ph] || ph;
+      phaseSel.appendChild(o);
+    });
+    phaseSel.disabled = list.length === 0;
+    if (list.length && LAST_PHASE && list.indexOf(LAST_PHASE) !== -1) {
+      phaseSel.value = LAST_PHASE;
+    }
+  }
+
+  sci.addEventListener("input", syncPhases);
   sci.value = matchGuess(d.guess);
+  syncPhases();
 
   var map = L.map(mapId, { scrollWheelZoom:true });
   L.tileLayer("https://tiles.maps.eox.at/wmts/1.0.0/s2cloudless-2024_3857/default/g/{z}/{y}/{x}.jpg",
@@ -555,8 +817,15 @@ function render(d){
     coords.dataset.lat = lat; coords.dataset.lng = lng;
   }
 
-  if (d.lat !== null && d.lng !== null) { place(d.lat, d.lng, 13); }
+  var lock = document.getElementById("dive-lock").checked;
+  if (lock && DIVE.lat !== null) { place(DIVE.lat, DIVE.lng, 12); }
+  else if (d.lat !== null && d.lng !== null) { place(d.lat, d.lng, 13); }
   else { map.fitBounds(HAWAII); }
+
+  var diveDate = document.getElementById("dive-date").value;
+  var diveSite = document.getElementById("dive-site").value;
+  if (diveDate) wrap.querySelector(".date").value = diveDate;
+  if (diveSite) wrap.querySelector(".site").value = diveSite;
 
   map.on("click", function(e){ place(e.latlng.lat, e.latlng.lng); });
   wrap.querySelector(".clear").addEventListener("click", function(){
@@ -575,6 +844,7 @@ function render(d){
       date: wrap.querySelector(".date").value,
       site: wrap.querySelector(".site").value,
       note: wrap.querySelector(".note").value,
+      phase: phaseSel.value,
       nomap: wrap.querySelector(".nomap").checked,
       lat: coords.dataset.lat ? parseFloat(coords.dataset.lat) : null,
       lng: coords.dataset.lng ? parseFloat(coords.dataset.lng) : null
@@ -586,6 +856,7 @@ function render(d){
       msg.className = "msg good";
       msg.textContent = "Filed as " + res.file + " · site rebuilt";
       SHOT.add(body.scientific_name);
+      LAST_PHASE = body.phase || LAST_PHASE;
       refreshStatus();
       wrap.classList.add("done");
       wrap.querySelector(".clear").disabled = true;

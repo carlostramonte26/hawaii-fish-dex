@@ -389,6 +389,38 @@ a { color: inherit; }
 .s-waif,
 .s-questionable { color: var(--muted); border-style: dashed; }
 
+.pips { display: inline-flex; gap: .22rem; margin: .55rem 0 0 .5rem; vertical-align: middle; }
+
+.pips i {
+  width: .42rem;
+  height: .42rem;
+  border-radius: 50%;
+  border: 1px solid var(--hairline);
+  display: block;
+}
+
+.pips i.on { background: var(--gold); border-color: var(--gold); }
+
+.phasehead {
+  font-family: Fraunces, Georgia, serif;
+  font-weight: 400;
+  font-size: 1.05rem;
+  margin: .4rem 0 -.4rem;
+  color: #a7c2ca;
+}
+
+.phasehead:first-child { margin-top: 0; }
+
+.gap {
+  border: 1px dashed var(--hairline);
+  padding: 1.6rem;
+  text-align: center;
+  background: repeating-linear-gradient(135deg,
+    transparent 0 11px, rgba(255, 255, 255, .022) 11px 22px);
+}
+
+.gap p { margin: 0; color: var(--muted); font-size: .88rem; }
+
 .empty { color: var(--muted); padding: 3rem 0; }
 
 /* -------------------------------------------------------------- specimen */

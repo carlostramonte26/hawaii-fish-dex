@@ -14,6 +14,7 @@
     document.querySelectorAll(".segmented button")
   );
   var seenFilter = "";
+  var partialOnly = false;
 
   function apply() {
     var term = (q.value || "").trim().toLowerCase();
@@ -26,7 +27,8 @@
         (!term || card.dataset.search.indexOf(term) !== -1) &&
         (!fam || card.dataset.family === fam) &&
         (!st || card.dataset.status === st) &&
-        (!seenFilter || card.dataset.seen === seenFilter);
+        (!seenFilter || card.dataset.seen === seenFilter) &&
+        (!partialOnly || card.dataset.partial === "1");
       card.hidden = !ok;
       if (ok) visible++;
     });
@@ -42,7 +44,8 @@
     button.addEventListener("click", function () {
       buttons.forEach(function (b) { b.classList.remove("on"); });
       button.classList.add("on");
-      seenFilter = button.dataset.seen;
+      partialOnly = button.dataset.partial === "1";
+      seenFilter = partialOnly ? "" : (button.dataset.seen || "");
       apply();
     });
   });

@@ -112,6 +112,38 @@ def species_rows() -> list:
     return sorted(out, key=lambda r: r["sci"])
 
 
+def filed_photos() -> list:
+    """Everything currently in photos/, newest first."""
+    out = []
+    for photo in PHOTOS.iterdir():
+        if photo.suffix.lower() not in {".jpg", ".jpeg", ".png", ".webp",
+                                        ".tif", ".tiff"}:
+            continue
+        side = photo.with_suffix(".json")
+        data = {}
+        if side.is_file():
+            try:
+                data = json.loads(side.read_text(encoding="utf-8"))
+            except Exception:
+                data = {}
+        out.append({
+            "file": photo.name,
+            "url": "/filed/" + photo.name,
+            "scientific_name": data.get("scientific_name", ""),
+            "date": data.get("date", ""),
+            "site": data.get("site", ""),
+            "phase": data.get("phase", ""),
+            "note": data.get("note", ""),
+            "nomap": bool(data.get("nomap")),
+            "lat": data.get("lat"),
+            "lng": data.get("lng"),
+            "sidecar": side.is_file(),
+            "mtime": photo.stat().st_mtime,
+        })
+    out.sort(key=lambda r: r["mtime"], reverse=True)
+    return out
+
+
 def already_shot() -> set:
     """Scientific names that already have at least one photo filed."""
     names = set()
@@ -211,6 +243,16 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json({"species": species_rows(),
                                    "shot": sorted(already_shot())})
 
+        if path == "/api/filed":
+            return self.send_json({"photos": filed_photos()})
+
+        if path.startswith("/filed/"):
+            name = safe_name(path[len("/filed/"):])
+            target = PHOTOS / name
+            if not target.is_file():
+                return self.send_json({"error": "not found"}, 404)
+            return self.send_bytes(target.read_bytes(), "image/jpeg")
+
         if path == "/api/worms":
             name = (urllib.parse.parse_qs(parsed.query).get("name") or [""])[0]
             return self.send_json(worms_lookup(name.strip()))
@@ -257,6 +299,10 @@ class Handler(BaseHTTPRequestHandler):
             return self.commit(body)
         if parsed.path == "/api/species":
             return self.add_species(body)
+        if parsed.path == "/api/photo/update":
+            return self.update_photo(body)
+        if parsed.path == "/api/photo/delete":
+            return self.delete_photo(body)
         if parsed.path == "/api/build":
             return self.send_json({"build": rebuild()})
         if parsed.path == "/api/publish":
@@ -302,6 +348,75 @@ class Handler(BaseHTTPRequestHandler):
 
         print(f"  added {sci} to the checklist ({status})")
         return self.send_json({"ok": True, "species": row, "build": rebuild()})
+
+    def update_photo(self, body):
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except Exception:
+            return self.send_json({"error": "bad request"}, 400)
+
+        photo = PHOTOS / safe_name(payload.get("file", ""))
+        side = photo.with_suffix(".json")
+        if not photo.is_file() or not side.is_file():
+            return self.send_json({"error": "that photo is no longer here"}, 400)
+
+        sci = " ".join((payload.get("scientific_name") or "").split())
+        known = {r["sci"] for r in species_rows()}
+        if sci not in known:
+            return self.send_json(
+                {"error": f"{sci or 'that name'} isn't in the checklist"}, 400)
+
+        lat, lng = payload.get("lat"), payload.get("lng")
+        if lat is not None and lng is not None:
+            try:
+                lat, lng = float(lat), float(lng)
+            except (TypeError, ValueError):
+                return self.send_json({"error": "those coordinates don't parse"}, 400)
+            if not sane(lat, lng):
+                return self.send_json({"error": "coordinates out of range"}, 400)
+        else:
+            lat = lng = None
+
+        record = {
+            "scientific_name": sci,
+            "date": (payload.get("date") or "").strip(),
+            "site": (payload.get("site") or "").strip(),
+            "lat": lat,
+            "lng": lng,
+            "nomap": bool(payload.get("nomap")),
+        }
+        phase = (payload.get("phase") or "").strip().lower()
+        if phase in PHASE_LABEL:
+            record["phase"] = phase
+        if payload.get("note"):
+            record["note"] = str(payload["note"]).strip()
+
+        # Keep the filename honest if the species changed.
+        stem = slugify(sci).replace("-", "_")
+        if not photo.stem.startswith(stem):
+            fresh = unique_path(PHOTOS, stem, photo.suffix)
+            photo.rename(fresh)
+            side.unlink(missing_ok=True)
+            photo, side = fresh, fresh.with_suffix(".json")
+
+        side.write_text(json.dumps(record, indent=1, ensure_ascii=False),
+                        encoding="utf-8")
+        print(f"  updated {photo.name}  ->  {sci}")
+        return self.send_json({"ok": True, "file": photo.name,
+                               "build": rebuild()})
+
+    def delete_photo(self, body):
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except Exception:
+            return self.send_json({"error": "bad request"}, 400)
+        photo = PHOTOS / safe_name(payload.get("file", ""))
+        if not photo.is_file():
+            return self.send_json({"error": "that photo is no longer here"}, 400)
+        photo.unlink()
+        photo.with_suffix(".json").unlink(missing_ok=True)
+        print(f"  deleted {photo.name}")
+        return self.send_json({"ok": True, "build": rebuild()})
 
     def publish(self, body):
         state = git_state()
@@ -497,6 +612,12 @@ button:disabled{opacity:.45;cursor:default}
 .phasepick{display:grid;grid-template-columns:1fr 1fr;gap:.2rem .6rem;margin-top:.2rem}
 .phasepick label{display:flex;align-items:center;gap:.4rem;margin:0;font-size:.85rem;color:var(--fg)}
 .phasepick input{accent-color:var(--gold)}
+.library{margin-top:2.5rem;border-top:1px solid var(--line);padding-top:1.4rem}
+.libhead{display:flex;justify-content:space-between;align-items:center;gap:1rem}
+.library h2{margin:0;font-size:1.05rem;font-weight:600}
+.danger{background:transparent;border:1px solid #7d3323;color:#ff9c7d}
+.danger:hover{background:#7d3323;color:var(--fg)}
+.libempty{color:var(--muted);font-size:.9rem;padding:1.4rem 0}
 select:disabled{opacity:.5}
 @media (max-width:800px){.divegrid,.newgrid{grid-template-columns:1fr}}
 </style></head><body>
@@ -573,6 +694,15 @@ select:disabled{opacity:.5}
     </div>
   </details>
   <div id="list"></div>
+
+  <section class="library">
+    <div class="libhead">
+      <h2>Already filed</h2>
+      <button type="button" class="btn ghost" id="lib-refresh">Refresh</button>
+    </div>
+    <p class="hint">Everything published so far. Edit anything, or remove it.</p>
+    <div id="lib"></div>
+  </section>
 </main>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script>
@@ -677,9 +807,141 @@ function lookupWorms(){
     });
 }
 
+function renderFiled(d){
+  var wrap = document.createElement("div");
+  wrap.className = "item";
+  var mapId = "lm-" + d.file.replace(/[^a-z0-9]/gi,"");
+  var opts = SPECIES.map(function(s){
+    var extra = [s.common, s.haw].filter(Boolean).join(" / ");
+    return '<option value="'+s.sci+'">'+s.sci+(extra?" — "+extra:"")+'</option>';
+  }).join("");
+
+  wrap.innerHTML =
+    '<div><img class="shot" src="'+d.url+'" alt=""><p class="hint">'+d.file+
+      (d.sidecar ? "" : ' <span style="color:#ff9c7d">no sidecar</span>')+'</p></div>'+
+    '<div>'+
+      '<label>Species</label>'+
+      '<input type="text" class="sci" list="'+mapId+'-list">'+
+      '<datalist id="'+mapId+'-list">'+opts+'</datalist>'+
+      '<label>Phase</label><select class="phase"></select>'+
+      '<label>Date</label><input type="date" class="date">'+
+      '<label>Site</label><input type="text" class="site">'+
+      '<label>Note</label><textarea class="note" rows="2"></textarea>'+
+      '<div class="check"><input type="checkbox" class="nomap" id="'+mapId+'-nm">'+
+        '<label for="'+mapId+'-nm" style="margin:0">Keep this position off the public map</label></div>'+
+    '</div>'+
+    '<div>'+
+      '<label>Position</label><div class="map" id="'+mapId+'"></div>'+
+      '<p class="coords">No position set</p>'+
+      '<div class="row"><button class="save">Save changes</button>'+
+        '<button class="ghost clear">Clear pin</button>'+
+        '<button class="danger del">Delete</button>'+
+        '<span class="msg"></span></div>'+
+    '</div>';
+
+  document.getElementById("lib").appendChild(wrap);
+
+  var sci = wrap.querySelector(".sci");
+  var phaseSel = wrap.querySelector(".phase");
+  sci.value = d.scientific_name || "";
+  wrap.querySelector(".date").value = d.date || "";
+  wrap.querySelector(".site").value = d.site || "";
+  wrap.querySelector(".note").value = d.note || "";
+  wrap.querySelector(".nomap").checked = !!d.nomap;
+
+  function syncPhases(keep){
+    var name = sci.value.split(" — ")[0].trim().toLowerCase();
+    var hit = SPECIES.filter(function(s){ return s.sci.toLowerCase() === name; })[0];
+    var list = (hit && hit.phases) ? hit.phases : [];
+    phaseSel.innerHTML = list.length
+      ? '<option value="">Pick a phase</option>'
+      : '<option value="">No phases tracked</option>';
+    list.forEach(function(ph){
+      var o = document.createElement("option");
+      o.value = ph; o.textContent = PHASE_LABEL[ph] || ph;
+      phaseSel.appendChild(o);
+    });
+    phaseSel.disabled = list.length === 0;
+    if (keep && list.indexOf(keep) !== -1) phaseSel.value = keep;
+  }
+  sci.addEventListener("input", function(){ syncPhases(); });
+  syncPhases(d.phase);
+
+  var map = L.map(mapId, { scrollWheelZoom:true });
+  L.tileLayer("https://tiles.maps.eox.at/wmts/1.0.0/s2cloudless-2024_3857/default/g/{z}/{y}/{x}.jpg",
+    { maxZoom:19, maxNativeZoom:14,
+      attribution:"Sentinel-2 cloudless by EOX (CC BY 4.0)" }).addTo(map);
+  var marker = null, coords = wrap.querySelector(".coords");
+  function show(lat,lng){
+    coords.textContent = lat.toFixed(6)+", "+lng.toFixed(6);
+    coords.dataset.lat = lat; coords.dataset.lng = lng;
+  }
+  function place(lat,lng,zoom){
+    if (marker) marker.setLatLng([lat,lng]);
+    else marker = L.marker([lat,lng],{draggable:true}).addTo(map)
+      .on("dragend", function(){ var q=marker.getLatLng(); show(q.lat,q.lng); });
+    show(lat,lng);
+    if (zoom) map.setView([lat,lng], zoom);
+  }
+  if (d.lat !== null && d.lat !== undefined) place(d.lat, d.lng, 11);
+  else map.fitBounds(HAWAII);
+  map.on("click", function(e){ place(e.latlng.lat, e.latlng.lng); });
+  wrap.querySelector(".clear").addEventListener("click", function(){
+    if (marker){ map.removeLayer(marker); marker = null; }
+    coords.textContent = "No position set";
+    delete coords.dataset.lat; delete coords.dataset.lng;
+  });
+
+  var msg = wrap.querySelector(".msg");
+  wrap.querySelector(".save").addEventListener("click", function(){
+    var btn = this; btn.disabled = true;
+    fetch("/api/photo/update", {method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({
+        file: d.file,
+        scientific_name: sci.value.split(" — ")[0].trim(),
+        phase: phaseSel.value,
+        date: wrap.querySelector(".date").value,
+        site: wrap.querySelector(".site").value,
+        note: wrap.querySelector(".note").value,
+        nomap: wrap.querySelector(".nomap").checked,
+        lat: coords.dataset.lat ? parseFloat(coords.dataset.lat) : null,
+        lng: coords.dataset.lng ? parseFloat(coords.dataset.lng) : null
+      })}).then(function(r){return r.json()}).then(function(res){
+        btn.disabled = false;
+        msg.className = "msg " + (res.error ? "bad" : "good");
+        msg.textContent = res.error || "Saved. Site rebuilt.";
+        if (!res.error){ d.file = res.file; refreshStatus(); }
+      });
+  });
+
+  wrap.querySelector(".del").addEventListener("click", function(){
+    if (!confirm("Delete " + d.file + " and its metadata? This can't be undone here.")) return;
+    fetch("/api/photo/delete", {method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({file: d.file})})
+      .then(function(r){return r.json()}).then(function(res){
+        if (res.error){ msg.className="msg bad"; msg.textContent=res.error; return; }
+        wrap.remove(); refreshStatus();
+      });
+  });
+}
+
+function loadLibrary(){
+  var box = document.getElementById("lib");
+  box.innerHTML = "";
+  fetch("/api/filed").then(function(r){return r.json()}).then(function(d){
+    if (!d.photos.length){
+      box.innerHTML = '<p class="libempty">Nothing filed yet.</p>';
+      return;
+    }
+    d.photos.forEach(renderFiled);
+  });
+}
+
 document.addEventListener("DOMContentLoaded", function(){
   refreshStatus();
   initDiveMap();
+  document.getElementById("lib-refresh").addEventListener("click", loadLibrary);
+  setTimeout(loadLibrary, 400);
   document.getElementById("ns-look").addEventListener("click", lookupWorms);
   document.getElementById("ns-add").addEventListener("click", addSpecies);
   document.getElementById("publish").addEventListener("click", function(){
@@ -858,6 +1120,7 @@ function render(d){
       SHOT.add(body.scientific_name);
       LAST_PHASE = body.phase || LAST_PHASE;
       refreshStatus();
+      loadLibrary();
       wrap.classList.add("done");
       wrap.querySelector(".clear").disabled = true;
     });

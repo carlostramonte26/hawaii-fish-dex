@@ -34,6 +34,7 @@ import html
 import os
 import re
 import shutil
+import urllib.parse
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -97,6 +98,37 @@ ENDEMIC_STATUSES = {"endemic", "endemic_nwhi"}
 # so initial/terminal is the right vocabulary there — a terminal-phase fish is
 # usually a secondary male, and initial phase holds females and some males.
 # male/female is for gonochoristic species that are simply dimorphic.
+# Keoki Stender's site files species under common-name folders. These are the
+# ones confirmed from his own index; anything else falls back to a site search.
+KEOKI_FOLDER = {
+    "Pomacanthidae": "angelfishes",
+    "Serranidae": "groupers", "Epinephelidae": "groupers",
+    "Anthiadidae": "groupers",
+    "Priacanthidae": "bigeyes", "Kuhliidae": "bigeyes",
+    "Holocentridae": "squirrelfishes",
+    "Gobiidae": "gobies", "Eleotridae": "gobies", "Oxudercidae": "gobies",
+    "Syngnathidae": "pipefishes", "Pegasidae": "pipefishes",
+    "Blenniidae": "blennies", "Tripterygiidae": "blennies",
+    "Callionymidae": "dragonets",
+    "Chaetodontidae": "butterflyfishes",
+    "Acanthuridae": "surgeonfishes",
+    "Kyphosidae": "chubs",
+    "Apogonidae": "cardinalfishes",
+    "Pomacentridae": "damselfishes",
+    "Mullidae": "goatfishes",
+    "Cirrhitidae": "hawkfishes", "Cheilodactylidae": "hawkfishes",
+    "Latridae": "hawkfishes",
+    "Monacanthidae": "filefishes",
+    "Muraenidae": "eels", "Congridae": "eels", "Ophichthidae": "eels",
+    "Moridae": "eels",
+    "Labridae": "wrasses",
+    "Scaridae": "parrotfishes",
+    "Tetraodontidae": "puffers",
+    "Scorpaenidae": "scorpionfishes",
+    "Bothidae": "flatfishes", "Soleidae": "flatfishes",
+}
+KEOKI = "https://www.marinelifephotography.com"
+
 PHASE_LABEL = {
     "juvenile": "Juvenile",
     "subadult": "Subadult",
@@ -537,6 +569,15 @@ def pings(species: dict, only: Species | None = None) -> list:
 _COVER_WARNED = False
 
 
+def keoki_link(sp: Species) -> str:
+    """Deep link where the folder is known, otherwise a search of his site."""
+    folder = KEOKI_FOLDER.get(sp.family)
+    if folder:
+        return f"{KEOKI}/fishes/{folder}/{slugify(sp.scientific_name)}.htm"
+    query = urllib.parse.quote(f"site:marinelifephotography.com {sp.scientific_name}")
+    return f"https://duckduckgo.com/?q={query}"
+
+
 def cover_image(species: dict) -> str:
     """Relative path to the image that represents the whole site."""
     global _COVER_WARNED
@@ -771,7 +812,8 @@ def render_species(sp: Species, species: dict) -> str:
     query = sp.scientific_name.replace(" ", "+")
     links = (f'<a href="https://www.marinespecies.org/aphia.php?p=taxlist&searchpar=0&tComp=contains&tName={query}">WoRMS</a>'
              f'<a href="https://www.fishbase.se/summary/{sp.scientific_name.replace(" ", "-")}.html">FishBase</a>'
-             f'<a href="https://www.gbif.org/species/search?q={query}">GBIF</a>')
+             f'<a href="https://www.gbif.org/species/search?q={query}">GBIF</a>'
+             f'<a href="{e(keoki_link(sp))}">Marine Life Photography</a>')
 
     siblings = "".join(
         f'<a href="{s.slug}.html" class="{"seen" if s.seen else "unseen"}">'

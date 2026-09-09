@@ -170,6 +170,13 @@
   group.addTo(map);
   map.fitBounds(group.getBounds(), { padding: [40, 40], maxZoom: 10 });
 
+  // The map box is resizable by its corner; Leaflet needs telling when that
+  // happens or it draws tiles for the old dimensions.
+  if (window.ResizeObserver) {
+    var watcher = new ResizeObserver(function () { map.invalidateSize(); });
+    watcher.observe(node);
+  }
+
   // Scroll-zoom is off so the page still scrolls; click the map to enable it.
   map.on("click", function () { map.scrollWheelZoom.enable(); });
   map.on("mouseout", function () { map.scrollWheelZoom.disable(); });

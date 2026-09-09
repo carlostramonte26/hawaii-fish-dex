@@ -18,6 +18,7 @@ scripts/build.py still works on its own if you'd rather drive it by hand.
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import mimetypes
 import urllib.request
@@ -41,6 +42,8 @@ ROOT = Path(__file__).resolve().parent.parent
 PHOTOS = ROOT / "photos"
 STAGING = ROOT / ".staging"
 DATA = ROOT / "data" / "species.csv"
+DIVES = ROOT / "data" / "dives.csv"
+DIVE_FIELDS = ["id", "label", "date", "site", "lat", "lng", "notes"]
 PORT = int(os.environ.get("DEX_INGEST_PORT", "8777"))
 SITE = ROOT / "site"
 MAX_UPLOAD = 80 * 1024 * 1024
@@ -105,9 +108,6 @@ def species_rows() -> list:
                     "haw": (row.get("hawaiian_name") or "").strip(),
                     "family": (row.get("family") or "").strip(),
                     "status": (row.get("status") or "").strip(),
-                    "phases": [x.strip().lower()
-                               for x in (row.get("phases") or "").split("|")
-                               if x.strip()],
                 })
     return sorted(out, key=lambda r: r["sci"])
 
@@ -132,7 +132,10 @@ def filed_photos() -> list:
             "scientific_name": data.get("scientific_name", ""),
             "date": data.get("date", ""),
             "site": data.get("site", ""),
-            "phase": data.get("phase", ""),
+            "sex": data.get("sex", ""),
+            "stage": data.get("stage", ""),
+            "dive": data.get("dive", ""),
+            "own_position": bool(data.get("own_position")),
             "note": data.get("note", ""),
             "nomap": bool(data.get("nomap")),
             "lat": data.get("lat"),
@@ -159,11 +162,10 @@ def already_shot() -> set:
 STATUSES = ["endemic", "endemic_nwhi", "indigenous", "introduced",
             "not_in_hawaii", "waif", "questionable"]
 
-PHASE_LABEL = {
-    "juvenile": "Juvenile", "subadult": "Subadult", "adult": "Adult",
-    "initial": "Initial phase", "terminal": "Terminal phase",
-    "male": "Male", "female": "Female",
-}
+SEX_LABEL = {"female": "Female", "male": "Male",
+             "transitioning": "Transitioning"}
+STAGE_LABEL = {"juvenile": "Juvenile", "intermediate": "Intermediate",
+               "adult": "Adult"}
 
 
 def worms_lookup(name: str) -> dict:
@@ -188,6 +190,55 @@ def worms_lookup(name: str) -> dict:
         "accepted": rec.get("valid_name") or "",
         "worms_status": rec.get("status") or "",
     }
+
+
+def dive_rows() -> list:
+    if not DIVES.exists():
+        return []
+    with DIVES.open(newline="", encoding="utf-8") as fh:
+        rows = [r for r in csv.DictReader(fh) if (r.get("id") or "").strip()]
+    for r in rows:
+        for key in ("lat", "lng"):
+            try:
+                r[key] = float(r[key])
+            except (TypeError, ValueError):
+                r[key] = None
+    rows.sort(key=lambda r: (r.get("date") or "", r.get("label") or ""),
+              reverse=True)
+    return rows
+
+
+def write_dives(rows: list) -> None:
+    DIVES.parent.mkdir(parents=True, exist_ok=True)
+    with DIVES.open("w", newline="", encoding="utf-8") as fh:
+        w = csv.DictWriter(fh, fieldnames=DIVE_FIELDS, lineterminator="\n")
+        w.writeheader()
+        for r in rows:
+            w.writerow({k: ("" if r.get(k) is None else r.get(k, ""))
+                        for k in DIVE_FIELDS})
+
+
+def digest(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def known_hashes() -> dict:
+    """sha256 -> filename, for everything already filed."""
+    out = {}
+    for side in PHOTOS.glob("*.json"):
+        try:
+            meta = json.loads(side.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if meta.get("sha256"):
+            out[meta["sha256"]] = side.stem
+            continue
+        for ext in (".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff"):
+            twin = side.with_suffix(ext)
+            if twin.is_file():
+                out[digest(twin.read_bytes())] = side.stem
+                break
+    return out
 
 
 def safe_name(text: str) -> str:
@@ -242,6 +293,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/species":
             return self.send_json({"species": species_rows(),
                                    "shot": sorted(already_shot())})
+
+        if path == "/api/dives":
+            return self.send_json({"dives": dive_rows()})
 
         if path == "/api/filed":
             return self.send_json({"photos": filed_photos()})
@@ -299,6 +353,10 @@ class Handler(BaseHTTPRequestHandler):
             return self.commit(body)
         if parsed.path == "/api/species":
             return self.add_species(body)
+        if parsed.path == "/api/dives":
+            return self.save_dive(body)
+        if parsed.path == "/api/dives/delete":
+            return self.remove_dive(body)
         if parsed.path == "/api/photo/update":
             return self.update_photo(body)
         if parsed.path == "/api/photo/delete":
@@ -335,8 +393,6 @@ class Handler(BaseHTTPRequestHandler):
             "common_name": (payload.get("common_name") or "").strip(),
             "hawaiian_name": (payload.get("hawaiian_name") or "").strip(),
             "status": status,
-            "phases": "|".join(
-                ph for ph in (payload.get("phases") or []) if ph in PHASE_LABEL),
             "notes": (payload.get("notes") or "").strip(),
         }
 
@@ -348,6 +404,87 @@ class Handler(BaseHTTPRequestHandler):
 
         print(f"  added {sci} to the checklist ({status})")
         return self.send_json({"ok": True, "species": row, "build": rebuild()})
+
+    def save_dive(self, body):
+        """Create or update one dive. Editing a pin moves every fish on it."""
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except Exception:
+            return self.send_json({"error": "bad request"}, 400)
+
+        label = (payload.get("label") or "").strip()
+        date = (payload.get("date") or "").strip()
+        site = (payload.get("site") or "").strip()
+        if not (label or site or date):
+            return self.send_json({"error": "give the dive a name or a date"}, 400)
+
+        lat, lng = payload.get("lat"), payload.get("lng")
+        if lat is not None and lng is not None:
+            try:
+                lat, lng = float(lat), float(lng)
+            except (TypeError, ValueError):
+                return self.send_json({"error": "those coordinates don't parse"}, 400)
+            if not sane(lat, lng):
+                return self.send_json({"error": "coordinates out of range"}, 400)
+        else:
+            lat = lng = None
+
+        rows = dive_rows()
+        ident = (payload.get("id") or "").strip()
+        if ident:
+            hit = next((r for r in rows if r["id"] == ident), None)
+            if not hit:
+                return self.send_json({"error": "that dive is gone"}, 400)
+        else:
+            base = slugify(" ".join(filter(None, [date, label or site]))) or "dive"
+            ident, n = base, 2
+            taken = {r["id"] for r in rows}
+            while ident in taken:
+                ident = f"{base}-{n:02d}"
+                n += 1
+            hit = {"id": ident}
+            rows.append(hit)
+
+        hit.update({"label": label, "date": date, "site": site,
+                    "lat": lat, "lng": lng,
+                    "notes": (payload.get("notes") or "").strip()})
+        write_dives(rows)
+        print(f"  saved dive {ident}")
+        return self.send_json({"ok": True, "id": ident, "dives": dive_rows(),
+                               "build": rebuild()})
+
+    def remove_dive(self, body):
+        try:
+            ident = json.loads(body.decode("utf-8")).get("id", "")
+        except Exception:
+            return self.send_json({"error": "bad request"}, 400)
+        rows = dive_rows()
+        keep = [r for r in rows if r["id"] != ident]
+        if len(keep) == len(rows):
+            return self.send_json({"error": "no such dive"}, 400)
+
+        # Photos keep their own coordinates rather than silently losing them.
+        orphaned = 0
+        for side in PHOTOS.glob("*.json"):
+            try:
+                meta = json.loads(side.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if meta.get("dive") != ident:
+                continue
+            gone = next(r for r in rows if r["id"] == ident)
+            if meta.get("lat") is None and gone.get("lat") is not None:
+                meta["lat"], meta["lng"] = gone["lat"], gone["lng"]
+            meta.pop("dive", None)
+            meta.pop("own_position", None)
+            side.write_text(json.dumps(meta, indent=1, ensure_ascii=False),
+                            encoding="utf-8")
+            orphaned += 1
+
+        write_dives(keep)
+        print(f"  deleted dive {ident}; {orphaned} photo(s) kept their position")
+        return self.send_json({"ok": True, "detached": orphaned,
+                               "dives": dive_rows(), "build": rebuild()})
 
     def update_photo(self, body):
         try:
@@ -385,9 +522,22 @@ class Handler(BaseHTTPRequestHandler):
             "lng": lng,
             "nomap": bool(payload.get("nomap")),
         }
-        phase = (payload.get("phase") or "").strip().lower()
-        if phase in PHASE_LABEL:
-            record["phase"] = phase
+        dive = (payload.get("dive") or "").strip()
+        if dive:
+            record["dive"] = dive
+            record["own_position"] = bool(payload.get("own_position"))
+        sex = (payload.get("sex") or "").strip().lower()
+        stage = (payload.get("stage") or "").strip().lower()
+        if sex in SEX_LABEL:
+            record["sex"] = sex
+        if stage in STAGE_LABEL:
+            record["stage"] = stage
+        try:
+            existing = json.loads(side.read_text(encoding="utf-8"))
+            if existing.get("sha256"):
+                record["sha256"] = existing["sha256"]
+        except Exception:
+            pass
         if payload.get("note"):
             record["note"] = str(payload["note"]).strip()
 
@@ -485,8 +635,13 @@ class Handler(BaseHTTPRequestHandler):
             im.thumbnail((900, 900), Image.LANCZOS)
             im.save(preview, "JPEG", quality=82)
 
+        sha = digest(body)
+        clash = known_hashes().get(sha)
+
         lat, lng = gps_from_pillow(staged)
         return self.send_json({
+            "sha256": sha,
+            "duplicate": clash,
             "id": staged.name,
             "original": original,
             "preview": "/staging/" + preview.name,
@@ -534,9 +689,18 @@ class Handler(BaseHTTPRequestHandler):
             "lng": lng,
             "nomap": bool(payload.get("nomap")),
         }
-        phase = (payload.get("phase") or "").strip().lower()
-        if phase in PHASE_LABEL:
-            sidecar["phase"] = phase
+        dive = (payload.get("dive") or "").strip()
+        if dive:
+            sidecar["dive"] = dive
+            sidecar["own_position"] = bool(payload.get("own_position"))
+        sex = (payload.get("sex") or "").strip().lower()
+        stage = (payload.get("stage") or "").strip().lower()
+        if sex in SEX_LABEL:
+            sidecar["sex"] = sex
+        if stage in STAGE_LABEL:
+            sidecar["stage"] = stage
+        if payload.get("sha256"):
+            sidecar["sha256"] = str(payload["sha256"])
         if payload.get("note"):
             sidecar["note"] = str(payload["note"]).strip()
         dest.with_suffix(".json").write_text(
@@ -547,8 +711,9 @@ class Handler(BaseHTTPRequestHandler):
 
         print(f"  filed {dest.name}  ->  {sci}"
               + (f"  @ {lat:.5f}, {lng:.5f}" if lat is not None else "  (no position)"))
-        summary = rebuild()
-        return self.send_json({"ok": True, "file": dest.name, "build": summary})
+        if payload.get("defer_build"):
+            return self.send_json({"ok": True, "file": dest.name})
+        return self.send_json({"ok": True, "file": dest.name, "build": rebuild()})
 
 
 PAGE = r"""<!doctype html>
@@ -587,7 +752,8 @@ label:first-child{margin-top:0}
 input[type=text],input[type=date],select,textarea{width:100%;font:inherit;font-size:.92rem;
  color:var(--fg);background:var(--panel);border:1px solid var(--line);border-radius:2px;padding:.45rem .6rem}
 input:focus,select:focus,textarea:focus{outline:2px solid var(--gold);outline-offset:1px}
-.map{height:250px;border:1px solid var(--line);border-radius:2px}
+.map{height:340px;min-height:180px;border:1px solid var(--line);border-radius:2px;
+ resize:vertical;overflow:hidden}
 .coords{font-size:.8rem;color:var(--muted);margin:.4rem 0 0;font-variant-numeric:tabular-nums}
 .row{display:flex;gap:.6rem;align-items:center;margin-top:.8rem;flex-wrap:wrap}
 button{font:inherit;font-size:.9rem;padding:.5rem .95rem;border-radius:2px;cursor:pointer;
@@ -604,14 +770,42 @@ button:disabled{opacity:.45;cursor:default}
 .dive{border:1px solid var(--line);border-radius:3px;padding:1rem 1.1rem;margin-bottom:1.2rem}
 .dive h2{margin:0;font-size:1rem;font-weight:600}
 .divegrid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.2fr);gap:1.2rem;margin-top:.8rem}
-.divegrid .map{height:210px}
+.divegrid .map{height:400px}
 .newsp{border:1px solid var(--line);border-radius:3px;padding:.8rem 1.1rem;margin:1.2rem 0}
 .newsp summary{cursor:pointer;font-size:.92rem;color:var(--gold)}
 .newgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:1.2rem;margin-top:.9rem}
 .newgrid .btn{margin-top:.8rem}
-.phasepick{display:grid;grid-template-columns:1fr 1fr;gap:.2rem .6rem;margin-top:.2rem}
-.phasepick label{display:flex;align-items:center;gap:.4rem;margin:0;font-size:.85rem;color:var(--fg)}
-.phasepick input{accent-color:var(--gold)}
+.pick{position:relative}
+.opts{display:none;position:absolute;z-index:900;left:0;right:0;top:100%;
+ max-height:260px;overflow:auto;background:var(--panel);border:1px solid var(--line);
+ border-top:0;border-radius:0 0 3px 3px;box-shadow:0 10px 30px rgba(0,0,0,.45)}
+.opt{padding:.4rem .6rem;cursor:pointer;font-size:.88rem;display:flex;
+ align-items:baseline;gap:.5rem}
+.opt:hover,.opt.mark{background:#123c4d}
+.opt b{font-weight:500}
+.opt span{color:var(--muted);font-size:.8rem}
+.opt em{margin-left:auto;color:var(--gold);font-style:normal;font-size:.72rem}
+.two{display:grid;grid-template-columns:1fr 1fr;gap:.7rem}
+.two label{margin-top:.7rem}
+.dupe{color:#ffb454}
+.qbar{display:flex;justify-content:space-between;align-items:center;gap:1rem;
+ flex-wrap:wrap;margin:1.2rem 0 .4rem;padding:.7rem .9rem;border:1px solid var(--line);
+ border-radius:3px;background:rgba(255,255,255,.02)}
+#qcount{font-size:.9rem;color:var(--muted)}
+.qrow{display:grid;grid-template-columns:120px minmax(0,1fr);gap:1rem;
+ padding:.8rem 0;border-bottom:1px solid var(--line);align-items:start}
+.qthumb{width:100%;border-radius:2px;display:block}
+.qmain{min-width:0}
+.qmeta{display:flex;gap:.5rem;align-items:center;flex-wrap:wrap;margin-top:.5rem}
+.qmeta select{width:auto;min-width:9rem}
+.qname{margin:.45rem 0 0;font-size:.78rem;color:var(--muted)}
+.small{font-size:.82rem;padding:.35rem .7rem}
+.qrow.done{opacity:.45}
+.details{margin-top:.9rem;padding-top:.8rem;border-top:1px solid var(--line)}
+.details .map{height:300px;margin-top:.6rem}
+@media (max-width:760px){.qrow{grid-template-columns:80px minmax(0,1fr)}}
+.libhead select{font:inherit;font-size:.9rem;color:var(--fg);background:var(--panel);
+ border:1px solid var(--line);border-radius:2px;padding:.4rem .6rem;max-width:22rem}
 .library{margin-top:2.5rem;border-top:1px solid var(--line);padding-top:1.4rem}
 .libhead{display:flex;justify-content:space-between;align-items:center;gap:1rem}
 .library h2{margin:0;font-size:1.05rem;font-weight:600}
@@ -636,22 +830,31 @@ select:disabled{opacity:.5}
 </header>
 <main>
   <section class="dive">
-    <h2>This dive</h2>
-    <p class="hint">Set it once. Every photo you add picks these up, and you can
-    still change any of them per fish.</p>
+    <div class="libhead">
+      <h2>Dive</h2>
+      <select id="dive-pick"></select>
+    </div>
+    <p class="hint">Saved on disk, so you can come back tomorrow and file more
+    fish onto the same pin. Editing the pin moves every photo on that dive.</p>
     <div class="divegrid">
       <div>
+        <label>Name</label><input type="text" id="dive-label" placeholder="North forereef">
         <label>Date</label><input type="date" id="dive-date">
         <label>Site</label><input type="text" id="dive-site" placeholder="Kure Atoll">
-        <div class="check"><input type="checkbox" id="dive-lock" checked>
-          <label for="dive-lock" style="margin:0">Reuse this pin for every new photo</label></div>
+        <label>Notes</label><textarea id="dive-notes" rows="2"></textarea>
         <p class="coords" id="dive-coords">No dive pin set</p>
+        <div class="row">
+          <button class="btn" id="dive-save">Save dive</button>
+          <button class="btn ghost" id="dive-new">New dive</button>
+          <button class="danger" id="dive-del">Delete</button>
+          <span class="msg" id="dive-msg"></span>
+        </div>
       </div>
       <div><div class="map" id="dive-map"></div></div>
     </div>
   </section>
 
-  <div id="drop">Drop photos here, or click to choose files
+  <div id="drop">Drop a whole dive's photos here, or click to choose files
     <input type="file" id="file" multiple accept="image/*"></div>
 
   <details class="newsp">
@@ -678,22 +881,18 @@ select:disabled{opacity:.5}
           <option value="waif">Waif</option>
           <option value="questionable">Questionable</option>
         </select>
-        <label>Phases to track</label>
-        <div class="phasepick" id="ns-phases">
-          <label><input type="checkbox" value="juvenile"> Juvenile</label>
-          <label><input type="checkbox" value="initial"> Initial phase</label>
-          <label><input type="checkbox" value="terminal"> Terminal phase</label>
-          <label><input type="checkbox" value="female"> Female</label>
-          <label><input type="checkbox" value="male"> Male</label>
-          <label><input type="checkbox" value="adult"> Adult</label>
-        </div>
-        <p class="hint">Leave empty unless the fish genuinely looks different.
-        Use initial/terminal for wrasses and parrotfishes.</p>
         <button type="button" class="btn" id="ns-add">Add to checklist</button>
       </div>
     </div>
   </details>
-  <div id="list"></div>
+  <div id="qbar" class="qbar" hidden>
+    <span id="qcount"></span>
+    <div class="row" style="margin:0">
+      <button class="btn" id="saveall">Save all</button>
+      <button class="btn ghost" id="clearsaved">Clear filed</button>
+    </div>
+  </div>
+  <div id="queue"></div>
 
   <section class="library">
     <div class="libhead">
@@ -706,9 +905,62 @@ select:disabled{opacity:.5}
 </main>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script>
-var SPECIES = [], SHOT = new Set(), LAST_PHASE = "";
-var PHASE_LABEL = {juvenile:"Juvenile", subadult:"Subadult", adult:"Adult",
-  initial:"Initial phase", terminal:"Terminal phase", male:"Male", female:"Female"};
+var SPECIES = [], SHOT = new Set(), LAST_SEX = "", LAST_STAGE = "";
+var SEX_OPTS = [["","Sex not recorded"],["female","Female"],
+  ["male","Male"],["transitioning","Transitioning"]];
+var STAGE_OPTS = [["","Stage not recorded"],["juvenile","Juvenile"],
+  ["intermediate","Intermediate"],["adult","Adult"]];
+
+function optionsHtml(pairs, chosen){
+  return pairs.map(function(o){
+    return '<option value="'+o[0]+'"'+(o[0]===chosen?" selected":"")+'>'+o[1]+'</option>';
+  }).join("");
+}
+
+// A search box that actually narrows as you type, rather than a datalist.
+function makePicker(input, box){
+  var open = false, marked = -1, shown = [];
+
+  function hide(){ box.innerHTML = ""; box.style.display = "none"; open = false; marked = -1; }
+
+  function draw(){
+    var q = input.value.trim().toLowerCase();
+    shown = (q ? SPECIES.filter(function(sp){
+      return (sp.sci + " " + sp.common + " " + sp.haw + " " + sp.family)
+        .toLowerCase().indexOf(q) !== -1;
+    }) : SPECIES).slice(0, 40);
+    if (!shown.length){ hide(); return; }
+    box.innerHTML = shown.map(function(sp, i){
+      var extra = [sp.common, sp.haw].filter(Boolean).join(" / ");
+      return '<div class="opt'+(i===marked?" mark":"")+'" data-i="'+i+'">'+
+        '<b>'+sp.sci+'</b>'+(extra?'<span>'+extra+'</span>':'')+
+        (SHOT.has(sp.sci)?'':'<em>new</em>')+'</div>';
+    }).join("");
+    box.style.display = "block"; open = true;
+  }
+
+  function pick(i){
+    if (!shown[i]) return;
+    input.value = shown[i].sci;
+    hide();
+    input.dispatchEvent(new Event("change"));
+  }
+
+  input.addEventListener("input", function(){ marked = -1; draw(); });
+  input.addEventListener("focus", draw);
+  input.addEventListener("blur", function(){ setTimeout(hide, 150); });
+  input.addEventListener("keydown", function(ev){
+    if (!open) return;
+    if (ev.key === "ArrowDown"){ marked = Math.min(marked+1, shown.length-1); ev.preventDefault(); draw(); }
+    else if (ev.key === "ArrowUp"){ marked = Math.max(marked-1, 0); ev.preventDefault(); draw(); }
+    else if (ev.key === "Enter"){ if (marked >= 0){ ev.preventDefault(); pick(marked); } }
+    else if (ev.key === "Escape"){ hide(); }
+  });
+  box.addEventListener("mousedown", function(ev){
+    var opt = ev.target.closest(".opt");
+    if (opt) { ev.preventDefault(); pick(parseInt(opt.dataset.i, 10)); }
+  });
+}
 var HAWAII = [[18.6,-179.5],[22.6,-154.6]];
 
 function refreshStatus(){
@@ -729,7 +981,7 @@ function refreshStatus(){
   });
 }
 
-var DIVE = { lat:null, lng:null, marker:null, map:null };
+var DIVE = { lat:null, lng:null, marker:null, map:null, id:"", list:[] };
 
 function setDivePin(lat, lng, zoom){
   DIVE.lat = lat; DIVE.lng = lng;
@@ -740,16 +992,107 @@ function setDivePin(lat, lng, zoom){
     });
   document.getElementById("dive-coords").textContent =
     lat.toFixed(6) + ", " + lng.toFixed(6);
-  if (zoom) DIVE.map.setView([lat,lng], zoom);
+}
+
+function clearDivePin(){
+  if (DIVE.marker){ DIVE.map.removeLayer(DIVE.marker); DIVE.marker = null; }
+  DIVE.lat = DIVE.lng = null;
+  document.getElementById("dive-coords").textContent = "No dive pin set";
+}
+
+function watchSize(map, node){
+  if (window.ResizeObserver){
+    new ResizeObserver(function(){ map.invalidateSize(); }).observe(node);
+  }
 }
 
 function initDiveMap(){
   DIVE.map = L.map("dive-map", { scrollWheelZoom:true });
+  watchSize(DIVE.map, document.getElementById("dive-map"));
   L.tileLayer("https://tiles.maps.eox.at/wmts/1.0.0/s2cloudless-2024_3857/default/g/{z}/{y}/{x}.jpg",
     { maxZoom:19, maxNativeZoom:14,
       attribution:"Sentinel-2 cloudless by EOX (CC BY 4.0)" }).addTo(DIVE.map);
   DIVE.map.fitBounds(HAWAII);
   DIVE.map.on("click", function(e){ setDivePin(e.latlng.lat, e.latlng.lng); });
+}
+
+function diveName(d){
+  return (d.label || d.site || d.date || d.id) +
+    (d.date && d.label ? "  ·  " + d.date : "");
+}
+
+function paintDiveList(){
+  var sel = document.getElementById("dive-pick");
+  sel.innerHTML = '<option value="">— new dive —</option>' +
+    DIVE.list.map(function(d){
+      return '<option value="'+d.id+'"'+(d.id===DIVE.id?" selected":"")+'>'+
+        diveName(d)+'</option>';
+    }).join("");
+  document.querySelectorAll("select.dive").forEach(function(s){
+    var keep = s.value;
+    s.innerHTML = '<option value="">No dive</option>' +
+      DIVE.list.map(function(d){
+        return '<option value="'+d.id+'">'+diveName(d)+'</option>';
+      }).join("");
+    s.value = keep;
+  });
+}
+
+function showDive(id){
+  DIVE.id = id || "";
+  var d = DIVE.list.filter(function(x){ return x.id === DIVE.id; })[0];
+  document.getElementById("dive-label").value = d ? (d.label||"") : "";
+  document.getElementById("dive-date").value  = d ? (d.date||"")  : "";
+  document.getElementById("dive-site").value  = d ? (d.site||"")  : "";
+  document.getElementById("dive-notes").value = d ? (d.notes||""): "";
+  clearDivePin();
+  if (d && d.lat !== null && d.lat !== undefined){
+    setDivePin(d.lat, d.lng);
+    DIVE.map.setView([d.lat, d.lng], 12);
+  }
+  document.getElementById("dive-del").disabled = !DIVE.id;
+  paintDiveList();
+}
+
+function loadDives(then){
+  fetch("/api/dives").then(function(r){return r.json()}).then(function(res){
+    DIVE.list = res.dives || [];
+    paintDiveList();
+    if (then) then();
+  });
+}
+
+function saveDive(){
+  var msg = document.getElementById("dive-msg");
+  fetch("/api/dives", {method:"POST", headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({
+      id: DIVE.id,
+      label: document.getElementById("dive-label").value,
+      date: document.getElementById("dive-date").value,
+      site: document.getElementById("dive-site").value,
+      notes: document.getElementById("dive-notes").value,
+      lat: DIVE.lat, lng: DIVE.lng
+    })}).then(function(r){return r.json()}).then(function(res){
+      msg.className = "msg " + (res.error ? "bad" : "good");
+      msg.textContent = res.error || "Dive saved.";
+      if (res.error) return;
+      DIVE.list = res.dives; DIVE.id = res.id;
+      paintDiveList(); showDive(res.id); refreshStatus(); loadLibrary();
+    });
+}
+
+function deleteDive(){
+  if (!DIVE.id) return;
+  if (!confirm("Delete this dive? Photos on it keep their coordinates.")) return;
+  fetch("/api/dives/delete", {method:"POST", headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({id: DIVE.id})}).then(function(r){return r.json()})
+    .then(function(res){
+      var msg = document.getElementById("dive-msg");
+      if (res.error){ msg.className="msg bad"; msg.textContent=res.error; return; }
+      msg.className = "msg good";
+      msg.textContent = res.detached + " photo(s) kept their position.";
+      DIVE.list = res.dives; showDive(""); refreshStatus(); loadLibrary();
+    });
 }
 
 function addSpecies(){
@@ -760,10 +1103,7 @@ function addSpecies(){
     hawaiian_name: document.getElementById("ns-haw").value,
     family: document.getElementById("ns-family").value,
     status: document.getElementById("ns-status").value,
-    aphia_id: document.getElementById("ns-sci").dataset.aphia || "",
-    phases: Array.prototype.slice.call(
-      document.querySelectorAll("#ns-phases input:checked")).map(function(b){
-        return b.value; })
+    aphia_id: document.getElementById("ns-sci").dataset.aphia || ""
   };
   fetch("/api/species", {method:"POST", headers:{"Content-Type":"application/json"},
     body: JSON.stringify(body)}).then(function(r){return r.json()}).then(function(res){
@@ -772,16 +1112,8 @@ function addSpecies(){
     msg.textContent = res.species.scientific_name + " added. It's in the dropdown now.";
     SPECIES.push({sci:res.species.scientific_name, common:res.species.common_name,
       haw:res.species.hawaiian_name, family:res.species.family,
-      status:res.species.status,
-      phases:(res.species.phases||"").split("|").filter(Boolean)});
+      status:res.species.status});
     SPECIES.sort(function(a,b){ return a.sci < b.sci ? -1 : 1; });
-    document.querySelectorAll("datalist").forEach(function(dl){
-      var o = document.createElement("option");
-      o.value = res.species.scientific_name;
-      o.textContent = res.species.scientific_name +
-        (res.species.common_name ? " — " + res.species.common_name : "") + " +";
-      dl.appendChild(o);
-    });
     ["ns-sci","ns-common","ns-haw","ns-family"].forEach(function(id){
       document.getElementById(id).value = "";
     });
@@ -811,19 +1143,20 @@ function renderFiled(d){
   var wrap = document.createElement("div");
   wrap.className = "item";
   var mapId = "lm-" + d.file.replace(/[^a-z0-9]/gi,"");
-  var opts = SPECIES.map(function(s){
-    var extra = [s.common, s.haw].filter(Boolean).join(" / ");
-    return '<option value="'+s.sci+'">'+s.sci+(extra?" — "+extra:"")+'</option>';
-  }).join("");
-
   wrap.innerHTML =
     '<div><img class="shot" src="'+d.url+'" alt=""><p class="hint">'+d.file+
       (d.sidecar ? "" : ' <span style="color:#ff9c7d">no sidecar</span>')+'</p></div>'+
     '<div>'+
       '<label>Species</label>'+
-      '<input type="text" class="sci" list="'+mapId+'-list">'+
-      '<datalist id="'+mapId+'-list">'+opts+'</datalist>'+
-      '<label>Phase</label><select class="phase"></select>'+
+      '<div class="pick"><input type="text" class="sci" autocomplete="off"></div>'+
+      '<div class="two">'+
+        '<div><label>Sex</label><select class="sex">'+optionsHtml(SEX_OPTS,d.sex||"")+'</select></div>'+
+        '<div><label>Stage</label><select class="stage">'+optionsHtml(STAGE_OPTS,d.stage||"")+'</select></div>'+
+      '</div>'+
+      '<label>Dive</label><select class="dive"></select>'+
+      '<div class="check"><input type="checkbox" class="ownpos" id="'+mapId+'-op"'+
+        (d.own_position?" checked":"")+'>'+
+        '<label for="'+mapId+'-op" style="margin:0">This fish had its own position</label></div>'+
       '<label>Date</label><input type="date" class="date">'+
       '<label>Site</label><input type="text" class="site">'+
       '<label>Note</label><textarea class="note" rows="2"></textarea>'+
@@ -842,32 +1175,24 @@ function renderFiled(d){
   document.getElementById("lib").appendChild(wrap);
 
   var sci = wrap.querySelector(".sci");
-  var phaseSel = wrap.querySelector(".phase");
+  var sexSel = wrap.querySelector(".sex");
+  var stageSel = wrap.querySelector(".stage");
+  var diveSel = wrap.querySelector(".dive");
+  var ownPos = wrap.querySelector(".ownpos");
+  paintDiveList();
+  diveSel.value = d.dive || "";
+  var picker = document.createElement("div");
+  picker.className = "opts";
+  sci.parentNode.appendChild(picker);
+  makePicker(sci, picker);
   sci.value = d.scientific_name || "";
   wrap.querySelector(".date").value = d.date || "";
   wrap.querySelector(".site").value = d.site || "";
   wrap.querySelector(".note").value = d.note || "";
   wrap.querySelector(".nomap").checked = !!d.nomap;
 
-  function syncPhases(keep){
-    var name = sci.value.split(" — ")[0].trim().toLowerCase();
-    var hit = SPECIES.filter(function(s){ return s.sci.toLowerCase() === name; })[0];
-    var list = (hit && hit.phases) ? hit.phases : [];
-    phaseSel.innerHTML = list.length
-      ? '<option value="">Pick a phase</option>'
-      : '<option value="">No phases tracked</option>';
-    list.forEach(function(ph){
-      var o = document.createElement("option");
-      o.value = ph; o.textContent = PHASE_LABEL[ph] || ph;
-      phaseSel.appendChild(o);
-    });
-    phaseSel.disabled = list.length === 0;
-    if (keep && list.indexOf(keep) !== -1) phaseSel.value = keep;
-  }
-  sci.addEventListener("input", function(){ syncPhases(); });
-  syncPhases(d.phase);
-
   var map = L.map(mapId, { scrollWheelZoom:true });
+  watchSize(map, document.getElementById(mapId));
   L.tileLayer("https://tiles.maps.eox.at/wmts/1.0.0/s2cloudless-2024_3857/default/g/{z}/{y}/{x}.jpg",
     { maxZoom:19, maxNativeZoom:14,
       attribution:"Sentinel-2 cloudless by EOX (CC BY 4.0)" }).addTo(map);
@@ -899,7 +1224,10 @@ function renderFiled(d){
       body: JSON.stringify({
         file: d.file,
         scientific_name: sci.value.split(" — ")[0].trim(),
-        phase: phaseSel.value,
+        sex: sexSel.value,
+        stage: stageSel.value,
+        dive: diveSel.value,
+        own_position: ownPos.checked,
         date: wrap.querySelector(".date").value,
         site: wrap.querySelector(".site").value,
         note: wrap.querySelector(".note").value,
@@ -941,7 +1269,18 @@ document.addEventListener("DOMContentLoaded", function(){
   refreshStatus();
   initDiveMap();
   document.getElementById("lib-refresh").addEventListener("click", loadLibrary);
+  document.getElementById("saveall").addEventListener("click", saveAll);
+  document.getElementById("clearsaved").addEventListener("click", clearSaved);
   setTimeout(loadLibrary, 400);
+  loadDives();
+  document.getElementById("dive-pick").addEventListener("change", function(){
+    showDive(this.value);
+  });
+  document.getElementById("dive-save").addEventListener("click", saveDive);
+  document.getElementById("dive-del").addEventListener("click", deleteDive);
+  document.getElementById("dive-new").addEventListener("click", function(){
+    showDive("");
+  });
   document.getElementById("ns-look").addEventListener("click", lookupWorms);
   document.getElementById("ns-add").addEventListener("click", addSpecies);
   document.getElementById("publish").addEventListener("click", function(){
@@ -1000,132 +1339,196 @@ function matchGuess(text){
 
 function render(d){
   var wrap = document.createElement("div");
-  wrap.className = "item";
-
+  wrap.className = "qrow";
   var mapId = "m-" + d.id.replace(/[^a-z0-9]/gi,"");
-  var opts = SPECIES.map(function(s){
-    var extra = [s.common, s.haw].filter(Boolean).join(" / ");
-    var flag = SHOT.has(s.sci) ? "" : " +";
-    return '<option value="'+s.sci+'">'+s.sci+(extra?" — "+extra:"")+flag+'</option>';
-  }).join("");
 
   wrap.innerHTML =
-    '<div><img class="shot" src="'+d.preview+'" alt=""><p class="hint">'+d.original+'</p></div>'+
-    '<div>'+
-      '<label>Species</label>'+
-      '<input type="text" class="sci" list="'+mapId+'-list" placeholder="Start typing a name">'+
-      '<datalist id="'+mapId+'-list">'+opts+'</datalist>'+
-      '<p class="hint">A <span class="new">+</span> marks a species you have no photo of yet.</p>'+
-      '<label>Phase</label><select class="phase"><option value="">Not tracked</option></select>'+
-      '<label>Date</label><input type="date" class="date" value="'+(d.date||"")+'">'+
-      '<label>Site</label><input type="text" class="site" placeholder="Kāneʻohe Bay">'+
-      '<label>Note</label><textarea class="note" rows="2"></textarea>'+
-      '<div class="check"><input type="checkbox" class="nomap" id="'+mapId+'-nm">'+
-        '<label for="'+mapId+'-nm" style="margin:0">Keep this position off the public map</label></div>'+
-    '</div>'+
-    '<div>'+
-      '<label>Position — click the map to place it</label>'+
-      '<div class="map" id="'+mapId+'"></div>'+
-      '<p class="coords">No position set</p>'+
-      '<div class="row"><button class="save">Save</button>'+
-        '<button class="ghost clear">Clear pin</button>'+
-        '<span class="msg"></span></div>'+
+    '<img class="qthumb" src="'+d.preview+'" alt="">'+
+    '<div class="qmain">'+
+      '<div class="pick"><input type="text" class="sci" autocomplete="off" '+
+        'placeholder="Species — type to search"><div class="opts"></div></div>'+
+      '<div class="qmeta">'+
+        '<select class="sex">'+optionsHtml(SEX_OPTS,"")+'</select>'+
+        '<select class="stage">'+optionsHtml(STAGE_OPTS,"")+'</select>'+
+        '<select class="dive"></select>'+
+        '<button type="button" class="ghost small more">Details</button>'+
+        '<button type="button" class="small save">Save</button>'+
+        '<span class="msg"></span>'+
+      '</div>'+
+      '<p class="qname">'+d.original+
+        (d.duplicate ? ' <span class="dupe">already filed as '+d.duplicate+'</span>' : '')+
+      '</p>'+
+      '<div class="details" hidden>'+
+        '<div class="two">'+
+          '<div><label>Date</label><input type="date" class="date" value="'+(d.date||"")+'"></div>'+
+          '<div><label>Site</label><input type="text" class="site"></div>'+
+        '</div>'+
+        '<label>Note</label><textarea class="note" rows="2"></textarea>'+
+        '<div class="check"><input type="checkbox" class="ownpos" id="'+mapId+'-op">'+
+          '<label for="'+mapId+'-op" style="margin:0">This fish had its own position</label></div>'+
+        '<div class="check"><input type="checkbox" class="nomap" id="'+mapId+'-nm">'+
+          '<label for="'+mapId+'-nm" style="margin:0">Keep this position off the public map</label></div>'+
+        '<div class="map" id="'+mapId+'"></div>'+
+        '<p class="coords">Using the dive position</p>'+
+        '<button type="button" class="ghost small clear">Clear pin</button>'+
+      '</div>'+
     '</div>';
 
-  document.getElementById("list").prepend(wrap);
+  document.getElementById("queue").appendChild(wrap);
+  queueBar();
 
   var sci = wrap.querySelector(".sci");
-  var phaseSel = wrap.querySelector(".phase");
-
-  function syncPhases(){
-    var name = sci.value.split(" — ")[0].trim().toLowerCase();
-    var hit = SPECIES.filter(function(s){ return s.sci.toLowerCase() === name; })[0];
-    var list = (hit && hit.phases) ? hit.phases : [];
-    phaseSel.innerHTML = list.length
-      ? '<option value="">Pick a phase</option>'
-      : '<option value="">No phases tracked for this species</option>';
-    list.forEach(function(ph){
-      var o = document.createElement("option");
-      o.value = ph; o.textContent = PHASE_LABEL[ph] || ph;
-      phaseSel.appendChild(o);
-    });
-    phaseSel.disabled = list.length === 0;
-    if (list.length && LAST_PHASE && list.indexOf(LAST_PHASE) !== -1) {
-      phaseSel.value = LAST_PHASE;
-    }
-  }
-
-  sci.addEventListener("input", syncPhases);
-  sci.value = matchGuess(d.guess);
-  syncPhases();
-
-  var map = L.map(mapId, { scrollWheelZoom:true });
-  L.tileLayer("https://tiles.maps.eox.at/wmts/1.0.0/s2cloudless-2024_3857/default/g/{z}/{y}/{x}.jpg",
-    { maxZoom:18, maxNativeZoom:14,
-      attribution:"Sentinel-2 cloudless by EOX (CC BY 4.0)" }).addTo(map);
-
-  var marker = null;
+  var sexSel = wrap.querySelector(".sex");
+  var stageSel = wrap.querySelector(".stage");
+  var diveSel = wrap.querySelector(".dive");
+  var ownPos = wrap.querySelector(".ownpos");
   var coords = wrap.querySelector(".coords");
+  var msg = wrap.querySelector(".msg");
+  var details = wrap.querySelector(".details");
 
-  function place(lat, lng, zoom){
-    if (marker) marker.setLatLng([lat,lng]);
-    else marker = L.marker([lat,lng], {draggable:true}).addTo(map)
-      .on("dragend", function(){ var p = marker.getLatLng(); show(p.lat, p.lng); });
-    show(lat, lng);
-    if (zoom) map.setView([lat,lng], zoom);
+  paintDiveList();
+  if (DIVE.id) diveSel.value = DIVE.id;
+  makePicker(sci, wrap.querySelector(".opts"));
+  sci.value = matchGuess(d.guess);
+  if (LAST_SEX) sexSel.value = LAST_SEX;
+  if (LAST_STAGE) stageSel.value = LAST_STAGE;
+
+  function chosenDive(){
+    return DIVE.list.filter(function(x){ return x.id === diveSel.value; })[0];
   }
-  function show(lat, lng){
-    coords.textContent = lat.toFixed(6) + ", " + lng.toFixed(6);
+  function applyDive(){
+    var pd = chosenDive();
+    if (!pd) return;
+    if (pd.date && !wrap.querySelector(".date").value)
+      wrap.querySelector(".date").value = pd.date;
+    if (pd.site && !wrap.querySelector(".site").value)
+      wrap.querySelector(".site").value = pd.site;
+  }
+  applyDive();
+  diveSel.addEventListener("change", applyDive);
+
+  // The map is expensive, so it is only built if you actually open Details.
+  var map = null, marker = null;
+  function show(lat,lng){
+    coords.textContent = lat.toFixed(6)+", "+lng.toFixed(6);
     coords.dataset.lat = lat; coords.dataset.lng = lng;
   }
+  function place(lat,lng,zoom){
+    if (marker) marker.setLatLng([lat,lng]);
+    else marker = L.marker([lat,lng],{draggable:true}).addTo(map)
+      .on("dragend", function(){ var q=marker.getLatLng(); show(q.lat,q.lng); });
+    show(lat,lng);
+    if (zoom) map.setView([lat,lng], zoom);
+  }
+  function buildMap(){
+    if (map) { map.invalidateSize(); return; }
+    map = L.map(mapId, { scrollWheelZoom:true });
+    L.tileLayer("https://tiles.maps.eox.at/wmts/1.0.0/s2cloudless-2024_3857/default/g/{z}/{y}/{x}.jpg",
+      { maxZoom:19, maxNativeZoom:14,
+        attribution:"Sentinel-2 cloudless by EOX (CC BY 4.0)" }).addTo(map);
+    watchSize(map, document.getElementById(mapId));
+    var pd = chosenDive();
+    if (d.lat !== null && d.lng !== null) place(d.lat, d.lng, 13);
+    else if (pd && pd.lat !== null && pd.lat !== undefined) place(pd.lat, pd.lng, 12);
+    else map.fitBounds(HAWAII);
+    map.on("click", function(e){ place(e.latlng.lat, e.latlng.lng); });
+  }
 
-  var lock = document.getElementById("dive-lock").checked;
-  if (lock && DIVE.lat !== null) { place(DIVE.lat, DIVE.lng, 12); }
-  else if (d.lat !== null && d.lng !== null) { place(d.lat, d.lng, 13); }
-  else { map.fitBounds(HAWAII); }
-
-  var diveDate = document.getElementById("dive-date").value;
-  var diveSite = document.getElementById("dive-site").value;
-  if (diveDate) wrap.querySelector(".date").value = diveDate;
-  if (diveSite) wrap.querySelector(".site").value = diveSite;
-
-  map.on("click", function(e){ place(e.latlng.lat, e.latlng.lng); });
+  wrap.querySelector(".more").addEventListener("click", function(){
+    details.hidden = !details.hidden;
+    this.textContent = details.hidden ? "Details" : "Hide";
+    if (!details.hidden) setTimeout(buildMap, 30);
+  });
   wrap.querySelector(".clear").addEventListener("click", function(){
-    if (marker) { map.removeLayer(marker); marker = null; }
-    coords.textContent = "No position set";
+    if (marker && map){ map.removeLayer(marker); marker = null; }
+    coords.textContent = "Using the dive position";
     delete coords.dataset.lat; delete coords.dataset.lng;
   });
 
-  var msg = wrap.querySelector(".msg");
-  var save = wrap.querySelector(".save");
-  save.addEventListener("click", function(){
-    msg.className = "msg"; msg.textContent = "";
-    var body = {
+  wrap.payload = function(){
+    return {
       id: d.id,
       scientific_name: sci.value.split(" — ")[0].trim(),
+      sex: sexSel.value,
+      stage: stageSel.value,
+      dive: diveSel.value,
+      own_position: ownPos.checked,
+      sha256: d.sha256 || "",
       date: wrap.querySelector(".date").value,
       site: wrap.querySelector(".site").value,
       note: wrap.querySelector(".note").value,
-      phase: phaseSel.value,
       nomap: wrap.querySelector(".nomap").checked,
       lat: coords.dataset.lat ? parseFloat(coords.dataset.lat) : null,
       lng: coords.dataset.lng ? parseFloat(coords.dataset.lng) : null
     };
-    save.disabled = true;
-    fetch("/api/commit", {method:"POST", headers:{"Content-Type":"application/json"},
+  };
+
+  wrap.commit = function(deferBuild){
+    var body = wrap.payload();
+    if (!body.scientific_name){
+      msg.className = "msg bad"; msg.textContent = "needs a species";
+      return Promise.resolve(false);
+    }
+    body.defer_build = !!deferBuild;
+    msg.className = "msg"; msg.textContent = "saving…";
+    return fetch("/api/commit", {method:"POST", headers:{"Content-Type":"application/json"},
       body: JSON.stringify(body)}).then(function(r){return r.json()}).then(function(res){
-      if (res.error){ msg.className="msg bad"; msg.textContent=res.error; save.disabled=false; return; }
-      msg.className = "msg good";
-      msg.textContent = "Filed as " + res.file + " · site rebuilt";
-      SHOT.add(body.scientific_name);
-      LAST_PHASE = body.phase || LAST_PHASE;
-      refreshStatus();
-      loadLibrary();
-      wrap.classList.add("done");
-      wrap.querySelector(".clear").disabled = true;
+        if (res.error){ msg.className="msg bad"; msg.textContent=res.error; return false; }
+        msg.className = "msg good"; msg.textContent = "filed";
+        SHOT.add(body.scientific_name);
+        LAST_SEX = body.sex; LAST_STAGE = body.stage;
+        wrap.classList.add("done");
+        wrap.saved = true;
+        queueBar();
+        return true;
+      });
+  };
+
+  wrap.querySelector(".save").addEventListener("click", function(){
+    var btn = this; btn.disabled = true;
+    wrap.commit(false).then(function(ok){
+      btn.disabled = false;
+      if (ok){ refreshStatus(); loadLibrary(); }
     });
   });
 }
+
+function queueBar(){
+  var rows = Array.prototype.slice.call(document.querySelectorAll(".qrow"));
+  var left = rows.filter(function(r){ return !r.saved; });
+  var bar = document.getElementById("qbar");
+  bar.hidden = rows.length === 0;
+  document.getElementById("qcount").textContent =
+    left.length ? left.length + " waiting to be filed" : "All filed.";
+  document.getElementById("saveall").disabled = left.length === 0;
+}
+
+function saveAll(){
+  var btn = document.getElementById("saveall");
+  btn.disabled = true; btn.textContent = "Saving…";
+  var rows = Array.prototype.slice.call(document.querySelectorAll(".qrow"))
+    .filter(function(r){ return !r.saved; });
+
+  // Save one at a time with the rebuild deferred, then rebuild once at the end.
+  var i = 0;
+  function next(){
+    if (i >= rows.length){
+      return fetch("/api/build", {method:"POST"}).then(function(){
+        btn.textContent = "Save all";
+        queueBar(); refreshStatus(); loadLibrary();
+      });
+    }
+    var row = rows[i++];
+    return row.commit(true).then(next);
+  }
+  next();
+}
+
+function clearSaved(){
+  document.querySelectorAll(".qrow.done").forEach(function(r){ r.remove(); });
+  queueBar();
+}
+
 </script></body></html>
 """
 

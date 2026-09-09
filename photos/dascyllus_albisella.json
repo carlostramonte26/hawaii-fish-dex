@@ -1,9 +1,12 @@
 {
  "scientific_name": "Dascyllus albisella",
- "date": "2026-08-28",
+ "date": "2026-09-06",
  "site": "Midway Atoll",
- "lat": 28.200511435228055,
- "lng": -177.32553213903154,
+ "lat": null,
+ "lng": null,
  "nomap": false,
- "phase": "adult"
+ "dive": "midway-atoll-dive-2",
+ "own_position": false,
+ "stage": "adult",
+ "sha256": "393b98e2df0e08e37e0fa3f6692db39a2e32c55cd6dcfcd5f24160d8b78a573e"
 }

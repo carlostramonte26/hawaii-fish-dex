@@ -110,11 +110,15 @@ a { color: inherit; }
 .mapwrap { position: relative; }
 
 #map {
-  height: clamp(340px, 46vh, 540px);
+  height: clamp(420px, 62vh, 760px);
+  min-height: 240px;
   border: 1px solid var(--hairline);
   border-radius: 2px;
   background: #0a2230;
   z-index: 1;
+  /* Leaflet already clips its container, so the native handle works here. */
+  resize: vertical;
+  overflow: hidden;
 }
 
 #map.off { display: grid; place-items: center; }
@@ -135,8 +139,11 @@ a { color: inherit; }
 }
 
 .minimap {
-  height: 220px;
+  height: 300px;
+  min-height: 160px;
   margin: 0 0 1.4rem;
+  resize: vertical;
+  overflow: hidden;
 }
 
 .legend {
@@ -421,6 +428,61 @@ a { color: inherit; }
 
 .gap p { margin: 0; color: var(--muted); font-size: .88rem; }
 
+.recorded {
+  display: block;
+  margin-top: .45rem;
+  font-size: .78rem;
+  color: var(--muted);
+}
+
+.divelink { margin: 1.2rem 0 0; }
+
+.divelink a {
+  font-size: .95rem;
+  color: var(--gold);
+  text-decoration: none;
+  border-bottom: 1px solid rgba(245, 184, 64, .35);
+}
+
+.dive-body {
+  display: grid;
+  grid-template-columns: minmax(0, 320px) minmax(0, 1fr);
+  gap: clamp(1.5rem, 4vw, 3rem);
+  padding: clamp(1.6rem, 4vw, 3rem) 0 4rem;
+  align-items: start;
+}
+
+.divemap {
+  height: 340px;
+  min-height: 180px;
+  margin-top: 1rem;
+  resize: vertical;
+  overflow: hidden;
+}
+
+.divelist { padding: 1.4rem 0 4rem; display: grid; gap: 1px; }
+
+.diverow {
+  display: grid;
+  grid-template-columns: 7.5rem minmax(0, 1fr) auto;
+  gap: 1rem;
+  align-items: baseline;
+  padding: .9rem .2rem;
+  text-decoration: none;
+  border-bottom: 1px solid var(--hairline);
+}
+
+.diverow:hover { background: rgba(255, 255, 255, .03); }
+.diverow:hover strong { color: var(--gold); }
+.divewhen { color: var(--muted); font-size: .86rem; font-variant-numeric: tabular-nums; }
+.divewhat strong { font-weight: 500; }
+.divewhat em { display: block; font-style: normal; font-size: .84rem; color: var(--muted); }
+.divecount { color: var(--muted); font-size: .84rem; }
+
+.divelinks { display: flex; flex-wrap: wrap; gap: .4rem; }
+.divelinks a { font-size: .85rem; color: var(--gold); text-decoration: none; }
+.divelinks a:hover { text-decoration: underline; }
+
 .empty { color: var(--muted); padding: 3rem 0; }
 
 /* -------------------------------------------------------------- specimen */
@@ -540,7 +602,9 @@ footer p { max-width: var(--measure); margin: 0; }
 /* ------------------------------------------------------------------ small */
 
 @media (max-width: 760px) {
-  #map { height: 320px; }
+  #map { height: 380px; }
+  .dive-body { grid-template-columns: 1fr; }
+  .diverow { grid-template-columns: 1fr; gap: .15rem; }
   .specimen-body { grid-template-columns: 1fr; }
   .shown { margin-left: 0; width: 100%; }
 }

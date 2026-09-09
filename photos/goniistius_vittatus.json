@@ -1,0 +1,12 @@
+{
+ "scientific_name": "Goniistius vittatus",
+ "date": "2026-09-06",
+ "site": "Midway Atoll",
+ "lat": 28.20172170869393,
+ "lng": -177.3271937771855,
+ "nomap": false,
+ "dive": "midway-atoll-dive-2",
+ "own_position": false,
+ "stage": "adult",
+ "sha256": "147944782f758195356916bad1459dfb7dc74d2c10d3718fed17493c7a37ab5e"
+}

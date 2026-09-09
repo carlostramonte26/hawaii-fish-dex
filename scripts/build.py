@@ -48,6 +48,7 @@ except ImportError:
 ROOT = Path(__file__).resolve().parent.parent
 PHOTOS = ROOT / "photos"
 DATA = ROOT / "data" / "species.csv"
+DIVES = ROOT / "data" / "dives.csv"
 ASSETS = ROOT / "assets"
 OUT = ROOT / "site"
 IMG = OUT / "img"
@@ -67,6 +68,9 @@ SITE_URL = os.environ.get(
 
 # The fish that represents the site when a link is shared.
 COVER_SPECIES = os.environ.get("DEX_COVER", "Apolemichthys arcuatus")
+
+# Filled in by main() so species pages can name the dives they link to.
+DIVE_TITLES = {}
 
 BLURB = ("A photographic catalog of the reef fishes of the Hawaiian "
          "Archipelago, with the endemics marked and every frame placed on "
@@ -93,6 +97,9 @@ STATUS_LABEL = {
     "questionable": "Questionable",
 }
 ENDEMIC_STATUSES = {"endemic", "endemic_nwhi"}
+
+# Set by main() so helpers stay quiet when the tool drives the build.
+SAY = [print]
 
 # Phases worth photographing separately. Labrids and scarids are protogynous,
 # so initial/terminal is the right vocabulary there — a terminal-phase fish is
@@ -129,18 +136,36 @@ KEOKI_FOLDER = {
 }
 KEOKI = "https://www.marinelifephotography.com"
 
-PHASE_LABEL = {
-    "juvenile": "Juvenile",
-    "subadult": "Subadult",
-    "adult": "Adult",
-    "initial": "Initial phase",
-    "terminal": "Terminal phase",
-    "male": "Male",
-    "female": "Female",
+# Sex and life stage are independent axes, asked on every photo. Neither is
+# required — plenty of fish can't be called from a single frame.
+SEX_LABEL = {"female": "Female", "male": "Male",
+             "transitioning": "Transitioning"}
+STAGE_LABEL = {"juvenile": "Juvenile", "intermediate": "Intermediate",
+               "adult": "Adult"}
+SEX_ORDER = ["female", "male", "transitioning", ""]
+STAGE_ORDER = ["juvenile", "intermediate", "adult", ""]
+
+# Sidecars written before sex and stage were split.
+LEGACY_PHASE = {
+    "juvenile": ("", "juvenile"),
+    "subadult": ("", "intermediate"),
+    "adult": ("", "adult"),
+    "initial": ("", "adult"),
+    "terminal": ("male", "adult"),
+    "male": ("male", ""),
+    "female": ("female", ""),
 }
 
-# Set by main() so helpers can stay quiet when the tool drives the build.
-SAY = [print]
+
+def variant_label(sex: str, stage: str) -> str:
+    if sex and stage:
+        return f"{STAGE_LABEL[stage]} {SEX_LABEL[sex].lower()}"
+    if stage:
+        return STAGE_LABEL[stage]
+    if sex:
+        return SEX_LABEL[sex]
+    return "Sex and stage not recorded"
+
 
 PIN_COLOR = {
     "endemic": "#f5b840",
@@ -162,7 +187,6 @@ class Species:
     common_name: str = ""
     hawaiian_name: str = ""
     status: str = "indigenous"
-    phases: tuple = ()
     notes: str = ""
     aphia_id: str = ""
     photos: list = field(default_factory=list)
@@ -180,20 +204,33 @@ class Species:
         return self.common_name or self.scientific_name
 
     @property
-    def phases_seen(self) -> list:
-        got = {p.phase for p in self.photos if p.phase}
-        return [ph for ph in self.phases if ph in got]
+    def variants(self) -> list:
+        """Distinct sex and stage combinations I have, in a sensible order."""
+        seen = {(p.sex, p.stage) for p in self.photos}
+        return sorted(seen, key=lambda v: (STAGE_ORDER.index(v[1]),
+                                           SEX_ORDER.index(v[0])))
 
     @property
-    def phases_missing(self) -> list:
-        return [ph for ph in self.phases if ph not in self.phases_seen]
+    def sexes_seen(self) -> list:
+        got = {p.sex for p in self.photos if p.sex}
+        return [x for x in SEX_ORDER if x in got]
 
     @property
-    def complete(self) -> bool:
-        """Nothing left to photograph for this species."""
-        if not self.phases:
-            return self.seen
-        return self.seen and not self.phases_missing
+    def stages_seen(self) -> list:
+        got = {p.stage for p in self.photos if p.stage}
+        return [x for x in STAGE_ORDER if x in got]
+
+    @property
+    def one_sex_only(self) -> bool:
+        """One of male/female recorded but not the other — worth chasing."""
+        got = set(self.sexes_seen)
+        return bool(got & {"male", "female"}) and not {"male", "female"} <= got
+
+    @property
+    def one_variant(self) -> bool:
+        """Photographed, but only ever as one sex/stage — a target for more."""
+        recorded = [(p.sex, p.stage) for p in self.photos if p.sex or p.stage]
+        return bool(recorded) and len(set(recorded)) == 1
 
     @property
     def regions(self) -> list:
@@ -210,6 +247,30 @@ class Species:
 
 
 @dataclass
+class Dive:
+    id: str
+    label: str = ""
+    date: str = ""
+    site: str = ""
+    lat: float | None = None
+    lng: float | None = None
+    notes: str = ""
+    photos: list = field(default_factory=list)
+
+    @property
+    def title(self) -> str:
+        return self.label or self.site or self.date or self.id
+
+    @property
+    def species(self) -> list:
+        out = []
+        for p in self.photos:
+            if p.species_name not in out:
+                out.append(p.species_name)
+        return out
+
+
+@dataclass
 class Photo:
     src: Path
     card: str = ""
@@ -219,7 +280,10 @@ class Photo:
     height: int = 0
     date: str = ""
     site: str = ""
-    phase: str = ""
+    dive: str = ""
+    species_name: str = ""
+    sex: str = ""
+    stage: str = ""
     note: str = ""
     lat: float | None = None
     lng: float | None = None
@@ -266,15 +330,40 @@ def load_species() -> dict:
                 common_name=(row.get("common_name") or "").strip(),
                 hawaiian_name=(row.get("hawaiian_name") or "").strip(),
                 status=status,
-                phases=tuple(
-                    ph for ph in
-                    (x.strip().lower() for x in (row.get("phases") or "").split("|"))
-                    if ph in PHASE_LABEL),
                 notes=(row.get("notes") or "").strip(),
                 aphia_id=(row.get("aphia_id") or "").strip(),
             )
     for bad in sorted(unknown):
         print(f"  unrecognised status '{bad}' treated as indigenous")
+    return out
+
+
+def load_dives() -> dict:
+    """Saved dives. Each photo points at one, so a pin is placed once."""
+    if not DIVES.exists():
+        return {}
+    out = {}
+    with DIVES.open(newline="", encoding="utf-8") as fh:
+        for row in csv.DictReader(fh):
+            ident = (row.get("id") or "").strip()
+            if not ident:
+                continue
+
+            def num(key):
+                raw = (row.get(key) or "").strip()
+                try:
+                    return float(raw)
+                except ValueError:
+                    return None
+
+            out[ident] = Dive(
+                id=ident,
+                label=(row.get("label") or "").strip(),
+                date=(row.get("date") or "").strip(),
+                site=(row.get("site") or "").strip(),
+                lat=num("lat"), lng=num("lng"),
+                notes=(row.get("notes") or "").strip(),
+            )
     return out
 
 
@@ -450,7 +539,7 @@ def resize(src: Path, dest: Path, box: int) -> tuple:
         return im.size
 
 
-def collect_photos(species: dict, idx: dict) -> tuple:
+def collect_photos(species: dict, idx: dict, dives: dict) -> tuple:
     files = sorted(p for p in PHOTOS.rglob("*")
                    if p.suffix.lower() in PHOTO_EXT and not p.name.startswith("."))
     if not files:
@@ -502,9 +591,21 @@ def collect_photos(species: dict, idx: dict) -> tuple:
             if tags.get(key):
                 date = str(tags[key])[:10].replace(":", "-")
                 break
-        date = side.get("date") or date or pillow_date(path)
+        dive_id = str(side.get("dive") or "").strip()
+        dive = dives.get(dive_id)
+        if dive_id and not dive:
+            SAY[0](f"  {path.name}: dive '{dive_id}' is not in dives.csv")
+            dive_id = ""
 
-        if side.get("lat") is not None and side.get("lng") is not None:
+        date = side.get("date") or (dive.date if dive else "") or date \
+            or pillow_date(path)
+        site = site or (dive.site if dive else "")
+
+        # A dive owns its position unless this frame explicitly overrides it.
+        own = bool(side.get("own_position"))
+        if dive and not own and sane(dive.lat, dive.lng):
+            lat, lng = dive.lat, dive.lng
+        elif side.get("lat") is not None and side.get("lng") is not None:
             lat, lng = side["lat"], side["lng"]
         else:
             lat, lng = gps_from_tags(tags) if tags else (None, None)
@@ -518,6 +619,14 @@ def collect_photos(species: dict, idx: dict) -> tuple:
                 lng = round(lng, GPS_PRECISION)
             located += 1
 
+        sex = str(side.get("sex") or "").strip().lower()
+        stage = str(side.get("stage") or "").strip().lower()
+        legacy = str(side.get("phase") or "").strip().lower()
+        if not sex and not stage and legacy in LEGACY_PHASE:
+            sex, stage = LEGACY_PHASE[legacy]
+        sex = sex if sex in SEX_LABEL else ""
+        stage = stage if stage in STAGE_LABEL else ""
+
         sp = species[name]
         stem = f"{sp.slug}-{len(sp.photos) + 1:02d}"
         w, h = resize(path, IMG / f"{stem}.jpg", FULL_PX)
@@ -530,8 +639,11 @@ def collect_photos(species: dict, idx: dict) -> tuple:
                                pin=f"img/{stem}-pin.jpg",
                                width=w, height=h, date=date,
                                site=str(site), lat=lat, lng=lng,
-                               phase=str(side.get("phase") or "").strip().lower(),
+                               dive=dive_id, species_name=sp.scientific_name,
+                               sex=sex, stage=stage,
                                note=str(side.get("note") or "")))
+        if dive:
+            dive.photos.append(sp.photos[-1])
         matched += 1
 
     if unmatched:
@@ -606,16 +718,14 @@ def card(sp: Species) -> str:
         media = '<span class="blank"></span>'
     haw = f'<span class="haw">{e(sp.hawaiian_name)}</span>' if sp.hawaiian_name else ""
     pips = ""
-    if sp.phases:
-        dots = "".join(
-            f'<i class="{"on" if ph in sp.phases_seen else ""}" '
-            f'title="{e(PHASE_LABEL[ph])}"></i>' for ph in sp.phases)
-        pips = (f'<span class="pips" aria-label="{len(sp.phases_seen)} of '
-                f'{len(sp.phases)} phases">{dots}</span>')
+    labels = [SEX_LABEL[x] for x in sp.sexes_seen] + \
+             [STAGE_LABEL[x] for x in sp.stages_seen]
+    if labels:
+        pips = f'<span class="recorded">{e(" · ".join(labels))}</span>'
     return f"""<a class="card {seen}" href="species/{sp.slug}.html"
    data-status="{e(sp.status)}" data-family="{e(sp.family)}"
    data-seen="{'1' if sp.seen else '0'}"
-   data-partial="{'1' if (sp.seen and sp.phases_missing) else '0'}"
+   data-partial="{'1' if sp.one_sex_only else '0'}"
    data-search="{e(' '.join(filter(None, [sp.scientific_name, sp.common_name, sp.hawaiian_name, sp.family])).lower())}">
   <figure>{media}</figure>
   <div class="meta">
@@ -669,7 +779,7 @@ def page(title: str, body: str, depth: int = 0, tail: str = "",
 </html>"""
 
 
-def render_index(species: dict) -> str:
+def render_index(species: dict, dives: dict) -> str:
     ordered = sorted(species.values(), key=lambda s: (s.family, s.scientific_name))
     total = len(ordered)
     seen = sum(1 for s in ordered if s.seen)
@@ -679,9 +789,9 @@ def render_index(species: dict) -> str:
     nwhi_total = sum(1 for s in ordered if s.status == "endemic_nwhi")
     nwhi_seen = sum(1 for s in ordered if s.status == "endemic_nwhi" and s.seen)
     pct = (seen / total * 100) if total else 0
-    phase_total = sum(len(s.phases) for s in ordered)
-    phase_seen = sum(len(s.phases_seen) for s in ordered)
-    part_done = sum(1 for s in ordered if s.seen and s.phases_missing)
+    sexed = sum(1 for s in ordered for ph in s.photos if ph.sex)
+    both_sexes = sum(1 for s in ordered if {"male", "female"} <= set(s.sexes_seen))
+    part_done = sum(1 for s in ordered if s.one_sex_only)
 
     data = pings(species)
     from_nwhi = sum(1 for p in data if p["lng"] < NWHI_CUTOFF)
@@ -701,6 +811,8 @@ def render_index(species: dict) -> str:
     <p class="lede">Reef fishes of the Hawaiian Archipelago, photographed as I
     find them. Where each one was, what it is, and how much of the list is
     still ahead of me.</p>
+    {'<p class="divelink"><a href="dives/index.html">Browse by dive →</a></p>'
+     if dives else ''}
   </div>
 </header>
 
@@ -715,7 +827,9 @@ def render_index(species: dict) -> str:
     <div class="legend">{legend}</div>
     <dl class="numbers">
       <div><dt>Frames in the catalog</dt><dd>{frames}</dd></div>
-      <div><dt>Phases photographed</dt><dd>{phase_seen} of {phase_total}</dd></div>
+      <div><dt>Frames with a sex recorded</dt><dd>{sexed}</dd></div>
+      <div><dt>Both sexes photographed</dt><dd>{both_sexes}</dd></div>
+      {f'<div><dt>Dives logged</dt><dd>{len(dives)}</dd></div>' if dives else ''}
       <div><dt>Frames with a position</dt><dd>{len(data)}</dd></div>
       <div><dt>Shot in the NWHI</dt><dd>{from_nwhi}</dd></div>
       <div><dt>Endemics</dt><dd>{endemic_seen} of {endemic_total}</dd></div>
@@ -738,7 +852,7 @@ def render_index(species: dict) -> str:
     <button type="button" data-seen="" class="on">All</button>
     <button type="button" data-seen="1">Photographed</button>
     <button type="button" data-seen="0">Still missing</button>
-    <button type="button" data-partial="1">Missing a phase ({part_done})</button>
+    <button type="button" data-partial="1">One sex only ({part_done})</button>
   </div>
   <p class="shown" id="shown"></p>
 </nav>
@@ -761,6 +875,101 @@ def render_index(species: dict) -> str:
                 desc=BLURB, image=cover_image(species), url="/")
 
 
+def render_dive(dive: Dive, species: dict) -> str:
+    shots = []
+    for photo in dive.photos:
+        sp = species[photo.species_name]
+        bits = " · ".join(filter(None, [SEX_LABEL.get(photo.sex, ""),
+                                        STAGE_LABEL.get(photo.stage, "")]))
+        shots.append(f"""<a class="card seen" href="../species/{sp.slug}.html">
+  <figure><img src="../{e(photo.card)}" alt="{e(sp.display_name)}"
+    loading="lazy" width="{photo.width}" height="{photo.height}"></figure>
+  <div class="meta">
+    <h3>{e(sp.display_name)}</h3>
+    <p class="sci">{e(sp.scientific_name)}</p>
+    <span class="badge s-{e(sp.status)}">{e(STATUS_LABEL[sp.status])}</span>
+    {f'<span class="recorded">{e(bits)}</span>' if bits else ''}
+  </div>
+</a>""")
+
+    facts = [("Date", dive.date or "—"), ("Site", dive.site or "—"),
+             ("Species", str(len(dive.species))),
+             ("Frames", str(len(dive.photos)))]
+    if dive.notes:
+        facts.append(("Notes", dive.notes))
+    table = "".join(f"<div><dt>{e(k)}</dt><dd>{e(v)}</dd></div>" for k, v in facts)
+
+    data = []
+    if sane(dive.lat, dive.lng):
+        data.append({"lat": dive.lat, "lng": dive.lng, "name": dive.title,
+                     "sci": dive.site, "slug": "", "status": "indigenous",
+                     "statusLabel": f"{len(dive.species)} species",
+                     "color": "#f5b840", "thumb": "", "date": dive.date,
+                     "site": dive.site})
+
+    body = f"""<header class="specimen">
+  <div class="wrap">
+    <a class="back" href="index.html">All dives</a>
+    <h1>{e(dive.title)}</h1>
+    <p class="sci">{e(" · ".join(filter(None, [dive.date, dive.site])))}</p>
+  </div>
+</header>
+<main class="wrap dive-body">
+  <div>
+    <dl class="facts row-facts">{table}</dl>
+    {'<div id="map" class="divemap"></div>' if data else ''}
+  </div>
+  <div class="grid">{"".join(shots) or '<p class="empty">Nothing filed from this dive yet.</p>'}</div>
+</main>"""
+
+    tail = (f'<script>window.DEX_PINGS = {json.dumps(data)};'
+            f'window.DEX_BASE = "../";</script>\n<script src="../app.js"></script>')
+    return page(f"{dive.title} — {TITLE}", body, 1, tail,
+                desc=f"{len(dive.species)} species photographed on this dive.",
+                url=f"{SITE_URL}/dives/{dive.id}.html")
+
+
+def render_dive_index(dives: dict, species: dict) -> str:
+    logged = sorted(dives.values(), key=lambda d: (d.date or "", d.title),
+                    reverse=True)
+    rows = []
+    for dive in logged:
+        rows.append(f"""<a class="diverow" href="{e(dive.id)}.html">
+  <span class="divewhen">{e(dive.date or "—")}</span>
+  <span class="divewhat"><strong>{e(dive.title)}</strong>
+    {f'<em>{e(dive.site)}</em>' if dive.site and dive.site != dive.title else ''}</span>
+  <span class="divecount">{len(dive.species)} species · {len(dive.photos)} frames</span>
+</a>""")
+
+    data = []
+    for dive in logged:
+        if not sane(dive.lat, dive.lng):
+            continue
+        data.append({"lat": dive.lat, "lng": dive.lng, "name": dive.title,
+                     "sci": dive.date or "", "slug": "", "status": "indigenous",
+                     "statusLabel": f"{len(dive.species)} species",
+                     "color": "#f5b840", "thumb": "", "date": dive.date,
+                     "site": dive.site})
+
+    body = f"""<header class="masthead">
+  <div class="wrap">
+    <a class="back" href="../index.html">Back to the catalog</a>
+    <h1>Dives</h1>
+    <p class="lede">Every dive I have filed fish from, and what came off each one.</p>
+  </div>
+</header>
+<main class="wrap">
+  {'<div class="mapwrap"><div id="map"></div></div>' if data else ''}
+  <div class="divelist">{"".join(rows) or '<p class="empty">No dives logged yet.</p>'}</div>
+</main>"""
+
+    tail = (f'<script>window.DEX_PINGS = {json.dumps(data)};'
+            f'window.DEX_BASE = "../";</script>\n<script src="../app.js"></script>')
+    return page(f"Dives — {TITLE}", body, 1, tail,
+                desc=f"{len(logged)} dives logged.",
+                url=f"{SITE_URL}/dives/index.html")
+
+
 def render_species(sp: Species, species: dict) -> str:
     same_family = [s for s in species.values()
                    if s.family == sp.family and s.scientific_name != sp.scientific_name]
@@ -775,39 +984,45 @@ def render_species(sp: Species, species: dict) -> str:
 </figure>"""
 
     if sp.seen:
-        if sp.phases:
+        groups = sp.variants
+        if len(groups) > 1 or (groups and any(groups[0])):
             blocks = []
-            for ph in sp.phases:
-                got = [p for p in sp.photos if p.phase == ph]
-                if got:
-                    blocks.append(f'<h2 class="phasehead">{e(PHASE_LABEL[ph])}</h2>'
-                                  f'{"".join(plate(p) for p in got)}')
-                else:
-                    blocks.append(
-                        f'<h2 class="phasehead">{e(PHASE_LABEL[ph])}</h2>'
-                        f'<div class="gap"><p>Not photographed yet.</p></div>')
-            loose = [p for p in sp.photos if p.phase not in sp.phases]
-            if loose:
-                blocks.append('<h2 class="phasehead">Unassigned</h2>'
-                              + "".join(plate(p) for p in loose))
+            for sex, stage in groups:
+                label = " · ".join(filter(None, [SEX_LABEL.get(sex, ""),
+                                                 STAGE_LABEL.get(stage, "")]))
+                got = [ph for ph in sp.photos if (ph.sex, ph.stage) == (sex, stage)]
+                blocks.append(
+                    f'<h2 class="phasehead">{e(label) if label else "Unrecorded"}</h2>'
+                    + "".join(plate(ph) for ph in got))
             gallery = f'<div class="plates">{"".join(blocks)}</div>'
         else:
-            gallery = f'<div class="plates">{"".join(plate(p) for p in sp.photos)}</div>'
+            gallery = f'<div class="plates">{"".join(plate(ph) for ph in sp.photos)}</div>'
     else:
         gallery = '<div class="plates missing"><p>Not photographed yet.</p></div>'
 
     rows = [("Family", sp.family or "—"),
             ("Hawaiian name", sp.hawaiian_name or "—"),
             ("Origin", STATUS_LABEL[sp.status])]
-    if sp.phases:
-        got = ", ".join(PHASE_LABEL[ph] for ph in sp.phases_seen) or "none yet"
-        rows.append(("Phases photographed",
-                     f"{got} ({len(sp.phases_seen)} of {len(sp.phases)})"))
+    if sp.sexes_seen:
+        rows.append(("Sexes photographed",
+                     ", ".join(SEX_LABEL[x] for x in sp.sexes_seen)))
+    if sp.stages_seen:
+        rows.append(("Stages photographed",
+                     ", ".join(STAGE_LABEL[x] for x in sp.stages_seen)))
     if sp.regions:
         rows.append(("I've found it in", ", ".join(sp.regions)))
+    seen_on = []
+    for photo in sp.photos:
+        if photo.dive and photo.dive not in seen_on:
+            seen_on.append(photo.dive)
     if sp.notes:
         rows.append(("Note", sp.notes))
     table = "".join(f"<div><dt>{e(k)}</dt><dd>{e(v)}</dd></div>" for k, v in rows)
+    if seen_on:
+        links = " ".join(
+            f'<a href="../dives/{e(d)}.html">{e(DIVE_TITLES.get(d, d))}</a>'
+            for d in seen_on)
+        table += f"<div><dt>Dives</dt><dd class=\"divelinks\">{links}</dd></div>"
 
     query = sp.scientific_name.replace(" ", "+")
     links = (f'<a href="https://www.marinespecies.org/aphia.php?p=taxlist&searchpar=0&tComp=contains&tName={query}">WoRMS</a>'
@@ -875,8 +1090,11 @@ def main(quiet: bool = False) -> dict:
     (OUT / "species").mkdir(parents=True, exist_ok=True)
     IMG.mkdir(parents=True, exist_ok=True)
 
+    dives = load_dives()
+    if dives:
+        say(f"  {len(dives)} dive(s) logged")
     idx = build_index(species)
-    matched, located = collect_photos(species, idx)
+    matched, located = collect_photos(species, idx, dives)
     seen = sum(1 for s in species.values() if s.seen)
     say(f"  {matched} photo(s) matched to {seen} species")
     blur = f", rounded to {GPS_PRECISION} dp" if GPS_PRECISION is not None else ""
@@ -884,7 +1102,18 @@ def main(quiet: bool = False) -> dict:
     if matched and not located:
         say("  no coordinates found — the map will stay empty")
 
-    (OUT / "index.html").write_text(render_index(species), encoding="utf-8")
+    DIVE_TITLES.clear()
+    DIVE_TITLES.update({d.id: d.title for d in dives.values()})
+
+    (OUT / "index.html").write_text(render_index(species, dives),
+                                    encoding="utf-8")
+    if dives:
+        (OUT / "dives").mkdir(exist_ok=True)
+        (OUT / "dives" / "index.html").write_text(
+            render_dive_index(dives, species), encoding="utf-8")
+        for dive in dives.values():
+            (OUT / "dives" / f"{dive.id}.html").write_text(
+                render_dive(dive, species), encoding="utf-8")
     for sp in species.values():
         (OUT / "species" / f"{sp.slug}.html").write_text(
             render_species(sp, species), encoding="utf-8")
@@ -912,7 +1141,8 @@ def main(quiet: bool = False) -> dict:
     if dropped:
         say(f"  pruned {dropped} image(s) with no photo behind them")
 
-    say(f"  wrote {len(species) + 1} pages to {OUT}")
+    say(f"  wrote {len(species) + 1 + (len(dives) + 1 if dives else 0)} "
+        f"pages to {OUT}")
     say(f"  preview:  python3 -m http.server -d {OUT} 8000")
 
     return {"total": len(species), "seen": seen,

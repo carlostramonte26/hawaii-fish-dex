@@ -1,8 +1,12 @@
 {
  "scientific_name": "Sargocentron xantherythrum",
- "date": "2026-08-28",
+ "date": "2026-09-06",
  "site": "Midway Atoll",
- "lat": 28.200511435228055,
- "lng": -177.32553213903154,
- "nomap": false
+ "lat": null,
+ "lng": null,
+ "nomap": false,
+ "dive": "midway-atoll-dive-2",
+ "own_position": false,
+ "stage": "adult",
+ "sha256": "b02a61d84c11fa23f9222b5b65a7f26c1ba216da8c8a0c13d991d8073ebf4597"
 }

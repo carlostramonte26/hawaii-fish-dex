@@ -1,10 +1,13 @@
 {
  "scientific_name": "Thalassoma ballieui",
- "date": "2026-08-28",
+ "date": "2026-09-06",
  "site": "Midway Atoll",
- "lat": 28.200511435228055,
- "lng": -177.32553213903154,
+ "lat": null,
+ "lng": null,
  "nomap": false,
- "phase": "adult",
- "note": "Female"
+ "dive": "midway-atoll-dive-2",
+ "own_position": false,
+ "sex": "female",
+ "stage": "adult",
+ "sha256": "d353c975b9612c87fd09fd1f94e8340e2e3e820cd1f0c4ea6d95233eaf3992b6"
 }

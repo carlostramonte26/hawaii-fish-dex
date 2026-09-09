@@ -1,0 +1,13 @@
+{
+ "scientific_name": "Thalassoma purpureum",
+ "date": "2026-09-08",
+ "site": "Midway Atoll",
+ "lat": null,
+ "lng": null,
+ "nomap": false,
+ "dive": "2026-08-28-midway-atoll-dive-3",
+ "own_position": false,
+ "sex": "male",
+ "stage": "adult",
+ "sha256": "91820e70fc137dab52cae7c563959ceb59849cf14c5dcc05af5ee5c21d354ade"
+}

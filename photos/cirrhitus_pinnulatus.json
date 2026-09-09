@@ -1,12 +1,12 @@
 {
  "scientific_name": "Cirrhitus pinnulatus",
- "date": "2026-09-06",
+ "date": "2026-08-28",
  "site": "Midway Atoll",
  "lat": null,
  "lng": null,
  "nomap": false,
  "dive": "midway-atoll-dive-2",
- "own_position": false,
+ "own_position": true,
  "stage": "adult",
  "sha256": "1841f4ca74fa40401fd9dd659ebf1a323064ccc5c7133bb96b56ed40a14c5754"
 }

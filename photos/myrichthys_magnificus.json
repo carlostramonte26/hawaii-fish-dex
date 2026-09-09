@@ -1,0 +1,12 @@
+{
+ "scientific_name": "Myrichthys magnificus",
+ "date": "2026-09-08",
+ "site": "Kure Atoll",
+ "lat": 28.414823824011695,
+ "lng": -178.37607383314767,
+ "nomap": false,
+ "dive": "2026-08-27-kure-atoll",
+ "own_position": false,
+ "stage": "adult",
+ "sha256": "f1006a85b589161a183199c96e0bfef244471223b1f18fbe7fcec2763ea54f68"
+}

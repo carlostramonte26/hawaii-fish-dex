@@ -1,0 +1,12 @@
+{
+ "scientific_name": "Apolemichthys arcuatus",
+ "date": "2026-09-08",
+ "site": "Midway Atoll",
+ "lat": null,
+ "lng": null,
+ "nomap": false,
+ "dive": "midway-atoll-dive-2",
+ "own_position": false,
+ "stage": "adult",
+ "sha256": "acb12348421d65877f6d9fee11a32e0935e374847ba668f44e519dbbbcae2a67"
+}
